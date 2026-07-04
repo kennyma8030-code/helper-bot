@@ -72,6 +72,9 @@ async def ask_gemini(prompt: str, message: str) -> str:
         model=GEMINI_MODEL,
         contents=message,
         config=genai.types.GenerateContentConfig(system_instruction=prompt),
+        config=types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())]
+    )
     )
     return response.text or ""
 
