@@ -142,10 +142,19 @@ async def on_message(message):
         print("[on_message] is a question, asking gemini for answer...", flush=True)
         answer = await ask_gemini(PROMPT1, message.content)
         print(f"[on_message] gemini answer: {answer!r}", flush=True)
+        answer = style_response(answer)
+        print(f"[on_message] styled answer: {answer!r}", flush=True)
         await message.reply(answer)
         print("[on_message] reply sent", flush=True)
     else:
         print("[on_message] not treated as a question, no reply", flush=True)
+
+
+def style_response(text: str) -> str:
+    """Enforce the persona in code: all lowercase, no periods (commas instead)."""
+    styled = text.lower().replace(".", ",")
+    # Avoid a dangling comma left where a sentence-ending period was.
+    return styled.rstrip(", ").rstrip()
 
 
 async def is_question(message):
