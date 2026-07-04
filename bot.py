@@ -64,7 +64,7 @@ It does NOT count as a question if it's:
 - A command with no informational ask ("stop that")
 
 Respond with only a JSON object in this exact format, no other text:
-{"is_question": true or false, "confidence": a number between 0 and 1}
+{"is_question": true or false}
 """
 
 async def ask_gemini(prompt: str, message: str) -> str:
@@ -139,7 +139,7 @@ async def on_message(message):
         print("[on_message] aborting: classifier did not return valid JSON", flush=True)
         return
     print(f"[on_message] parsed result: {result}", flush=True)
-    if result["is_question"] and result["confidence"] > .8:
+    if result["is_question"]:
         print("[on_message] is a question, asking gemini for answer...", flush=True)
         answer = await ask_gemini(PROMPT1, message.content)
         print(f"[on_message] gemini answer: {answer!r}", flush=True)
