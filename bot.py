@@ -68,14 +68,20 @@ Respond with only a JSON object in this exact format, no other text:
 
 async def ask_gemini(prompt: str, message: str) -> str:
     """Send `message` to Gemini under the given `prompt` and return the reply."""
-    response = await gemini_client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=message,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=prompt,
-            tools=[genai.types.Tool(google_search=genai.types.GoogleSearch())],
-        ),
-    )
+    print(f"[ask_gemini] calling Gemini, message={message!r}", flush=True)
+    try:
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=message,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=prompt,
+                tools=[genai.types.Tool(google_search=genai.types.GoogleSearch())],
+            ),
+        )
+    except Exception as e:
+        print(f"[ask_gemini] ERROR calling Gemini: {type(e).__name__}: {e}", flush=True)
+        raise
+    print(f"[ask_gemini] Gemini returned: {response.text!r}", flush=True)
     return response.text or ""
 
 
@@ -107,23 +113,40 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    print(f"[on_message] from {message.author} ({message.author.id}): {message.content!r}", flush=True)
+
     # Ignore the bot's own messages.
     if message.author == client.user:
+        print("[on_message] ignoring: own message", flush=True)
         return
 
     # Master switch — do nothing while disabled.
     if not bot_enabled:
+        print("[on_message] ignoring: bot disabled", flush=True)
         return
 
-    if message.author.id == TARGET_USER_ID:
-        try:
-            result = json.loads(await is_question(message.content))
-        except json.JSONDecodeError:
-            return
-        if result["is_question"] and result["confidence"] > .8:
-            answer = await ask_gemini(PROMPT1, message.content)
-            await message.reply(answer)
-        
+    if message.author.id != TARGET_USER_ID:
+        print(f"[on_message] ignoring: not target user (target={TARGET_USER_ID})", flush=True)
+        return
+
+    print("[on_message] target user matched, classifying...", flush=True)
+    raw = await is_question(message.content)
+    print(f"[on_message] classifier raw response: {raw!r}", flush=True)
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        print("[on_message] aborting: classifier did not return valid JSON", flush=True)
+        return
+    print(f"[on_message] parsed result: {result}", flush=True)
+    if result["is_question"] and result["confidence"] > .8:
+        print("[on_message] is a question, asking gemini for answer...", flush=True)
+        answer = await ask_gemini(PROMPT1, message.content)
+        print(f"[on_message] gemini answer: {answer!r}", flush=True)
+        await message.reply(answer)
+        print("[on_message] reply sent", flush=True)
+    else:
+        print("[on_message] not treated as a question, no reply", flush=True)
+
 
 async def is_question(message):
     return await ask_gemini(PROMPT2, message)
