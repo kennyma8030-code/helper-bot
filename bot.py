@@ -71,10 +71,10 @@ async def ask_gemini(prompt: str, message: str) -> str:
     response = await gemini_client.aio.models.generate_content(
         model=GEMINI_MODEL,
         contents=message,
-        config=genai.types.GenerateContentConfig(system_instruction=prompt),
-        config=types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())]
-    )
+        config=genai.types.GenerateContentConfig(
+            system_instruction=prompt,
+            tools=[genai.types.Tool(google_search=genai.types.GoogleSearch())],
+        ),
     )
     return response.text or ""
 
