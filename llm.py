@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 # One client for the whole process. Reads GEMINI_API_KEY from the environment.
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 
 async def ask_gemini(
