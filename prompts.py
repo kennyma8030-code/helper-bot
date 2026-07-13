@@ -168,23 +168,22 @@ HOW TO BEHAVE
 
 OUTPUT FORMAT — reply with ONLY this JSON object, no markdown fences, no extra text:
 {
-  "respond_to": { "0": false, "1": false, ... "{num_bots_plus_2}": false },
+  "respond_to": { "0": false, "1": false, ... "{num_bots_plus_1}": false },
   "message": "what you say to the chat",
   "bot_context": { "edit_context": false, "new_context": "" }
 }
 
 respond_to = who should reply to the message YOU are sending now. Every key from "0"
-to "{num_bots_plus_2}" must be present with a boolean value. The keys mean:
+to "{num_bots_plus_1}" must be present with a boolean value. The keys mean:
 - "1" through "{num_bots}": that specific bot should reply. You may set more than one
   bot to true. NEVER set your own number ("{bot_number}") to true.
 - "0": nobody should reply to this message.
-- "{num_bots_plus_1}": open floor — any bot may reply, and multiple bots may chime in.
-- "{num_bots_plus_2}": exactly one bot, chosen at random by the system, will reply.
+- "{num_bots_plus_1}": exactly one bot, chosen at random by the system, will reply.
 
-HARD RULE: "0", "{num_bots_plus_1}", and "{num_bots_plus_2}" are exclusive modes.
+HARD RULE: "0" and "{num_bots_plus_1}" are exclusive modes.
 If ANY ONE of them is true, then EVERY other key in respond_to must be false.
-Specific bot numbers may only be true when "0", "{num_bots_plus_1}", and
-"{num_bots_plus_2}" are all false.
+Specific bot numbers may only be true when "0" and "{num_bots_plus_1}" are
+both false.
 
 bot_context = your private notes:
 - If this turn changed how you feel (about a bot, or in general), set "edit_context":
@@ -205,23 +204,22 @@ and set a lighthearted, playful tone for the conversation that follows.
 
 OUTPUT FORMAT — reply with ONLY this JSON object, no markdown fences, no extra text:
 {
-  "respond_to": { "0": false, "1": false, ... "{num_bots_plus_2}": false },
+  "respond_to": { "0": false, "1": false, ... "{num_bots_plus_1}": false },
   "message": "what you say to the chat",
   "bot_context": { "edit_context": false, "new_context": "" }
 }
 
 respond_to = who should reply to the message YOU are sending now. Every key from "0"
-to "{num_bots_plus_2}" must be present with a boolean value. The keys mean:
+to "{num_bots_plus_1}" must be present with a boolean value. The keys mean:
 - "1" through "{num_bots}": that specific bot should reply. You may set more than one
   bot to true. NEVER set your own number ("1") to true.
 - "0": nobody should reply to this message.
-- "{num_bots_plus_1}": open floor — any bot may reply, and multiple bots may chime in.
-- "{num_bots_plus_2}": exactly one bot, chosen at random by the system, will reply.
+- "{num_bots_plus_1}": exactly one bot, chosen at random by the system, will reply.
 
-HARD RULE: "0", "{num_bots_plus_1}", and "{num_bots_plus_2}" are exclusive modes.
+HARD RULE: "0" and "{num_bots_plus_1}" are exclusive modes.
 If ANY ONE of them is true, then EVERY other key in respond_to must be false.
-Specific bot numbers may only be true when "0", "{num_bots_plus_1}", and
-"{num_bots_plus_2}" are all false.
+Specific bot numbers may only be true when "0" and "{num_bots_plus_1}" are
+both false.
 
 bot_context = your private notes about the other bots and the conversation. Since the
 conversation is just starting: if this opening gave you any feelings worth remembering,
@@ -238,7 +236,6 @@ def fill_prompt(template, *, bot_name, bot_number, num_bots, bot_roster):
         "{num_bots}": str(num_bots),
         "{bot_roster}": bot_roster,
         "{num_bots_plus_1}": str(num_bots + 1),
-        "{num_bots_plus_2}": str(num_bots + 2),
     }
     for token, value in values.items():
         template = template.replace(token, value)
