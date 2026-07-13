@@ -116,10 +116,15 @@ def handler_helper(client, index):
         if not test_enabled:
             return
 
+        print(f"[bot {index}] saw msg {message.id} from {message.author.id} "
+              f"(message_number={message_number}): {message.content[:80]!r}", flush=True)
+
         if message_number == 0:
             # Kickoff: the human's opening message; bot 1 answers, others wait.
             if message.author.id != ADMIN_USER_ID or index != 1:
+                print(f"[bot {index}] kickoff: not admin+bot1, ignoring", flush=True)
                 return
+            print(f"[bot {index}] kickoff: responding to human", flush=True)
             past_messages.append(f"human: {message.content}")
             prompt = fill_prompt(
                 KICKOFF_PROMPT,
@@ -129,15 +134,23 @@ def handler_helper(client, index):
         else:
             # Ignore my own messages.
             if message.author.id == bot_id_map[index]:
+                print(f"[bot {index}] own message, ignoring", flush=True)
                 return
             routing = prev_res.get("respond_to") or {}
             if routing.get("0"):
+                print(f"[bot {index}] routing says nobody replies, ignoring", flush=True)
                 return
             if routing.get(str(NUMBER_OF_BOTS + 1)):
-                if random_pick(message) != index:
+                pick = random_pick(message)
+                if pick != index:
+                    print(f"[bot {index}] random mode picked {pick}, not me, ignoring", flush=True)
                     return
+                print(f"[bot {index}] random mode picked me", flush=True)
             elif not routing.get(str(index)):
+                print(f"[bot {index}] not routed to me (routing={routing}), ignoring", flush=True)
                 return
+            else:
+                print(f"[bot {index}] routed to me, responding", flush=True)
             prompt = fill_prompt(
                 CONVO_PROMPT,
                 bot_name=f"{index}_bot", bot_number=index,
@@ -150,17 +163,19 @@ def handler_helper(client, index):
         if parsed is None or not parsed.get("message"):
             print(f"[bot {index}] unparseable response, skipping: {raw!r}", flush=True)
             return
+        print(f"[bot {index}] sending reply; respond_to={parsed.get('respond_to')}", flush=True)
 
-        await message.channel.send(parsed["message"])
-
-        # Store the response: routing for the next turn, the message into the
-        # rolling window, and this bot's private notes if it rewrote them.
+        # Store the response BEFORE sending: the gateway can deliver our sent
+        # message to the other clients before send() returns, and they must
+        # see the new routing/state when it arrives, not the previous turn's.
         prev_res = parsed
         past_messages.append(f"{index}_bot: {parsed['message']}")
         message_number += 1
         ctx = parsed.get("bot_context") or {}
         if ctx.get("edit_context"):
             bot_context[index] = str(ctx.get("new_context", ""))[:500]
+
+        await message.channel.send(parsed["message"])
 
 
 for i, client in enumerate(args, start=1):
