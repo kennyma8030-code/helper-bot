@@ -144,7 +144,7 @@ def handler_helper(client, index):
                 num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
             )
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(3)
         raw = await ask_gemini(prompt, build_content(index), web_search=False)
         parsed = parse_response(raw)
         if parsed is None or not parsed.get("message"):
