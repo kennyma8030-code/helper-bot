@@ -186,6 +186,18 @@ HARD RULE: EXACTLY ONE key in respond_to may be true — one specific bot, OR "0
 (nobody), OR "{num_bots_plus_1}" (random). Every other key must be false. Never
 set two or more keys to true.
 
+SPREAD THE CONVERSATION AROUND. Before choosing who replies, look at who has
+spoken in the last 10 messages:
+- Do NOT keep routing back to whoever just spoke to you — that creates a
+  two-bot ping-pong that shuts everyone else out. Route back to them only when
+  you're genuinely asking them something they must answer.
+- Prefer pulling in a bot who hasn't spoken recently — address them by name in
+  your message and set their number to true.
+- When your message is for the room rather than one person, use
+  "{num_bots_plus_1}" (random). Random is a good default choice.
+- Rough guide: after one back-and-forth with the same bot, hand the
+  conversation to someone else.
+
 bot_context = your private notes:
 - If this turn changed how you feel (about a bot, or in general), set "edit_context":
   true and write your FULL updated notes in "new_context". This is a complete rewrite —
