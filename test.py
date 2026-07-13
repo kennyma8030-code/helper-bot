@@ -41,6 +41,7 @@ bot_context = defaultdict(str)
 message_number = 0
 prev_res = {}
 test_enabled = False
+sleep_seconds = 3.0
 
 # Slash command lives on bot 1's client; it controls the whole test.
 tree = app_commands.CommandTree(args[0])
@@ -62,6 +63,22 @@ async def test(interaction: discord.Interaction, on: bool):
         bot_context.clear()
     await interaction.response.send_message(
         f"test is now {'on' if on else 'off'}.", ephemeral=True
+    )
+
+
+@tree.command(name="sleep", description="Set the delay before each bot reply, in seconds (admin only).")
+@app_commands.describe(seconds="Delay in seconds (e.g. 3, 10, 0 for none)")
+async def sleep(interaction: discord.Interaction, seconds: float):
+    global sleep_seconds
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message("NOT ALOUD!", ephemeral=True)
+        return
+    if seconds < 0:
+        await interaction.response.send_message("delay can't be negative.", ephemeral=True)
+        return
+    sleep_seconds = seconds
+    await interaction.response.send_message(
+        f"reply delay is now {seconds:g}s.", ephemeral=True
     )
 
 
@@ -157,7 +174,7 @@ def handler_helper(client, index):
                 num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
             )
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(sleep_seconds)
         raw = await ask_gemini(prompt, build_content(index), web_search=False)
         parsed = parse_response(raw)
         if parsed is None or not parsed.get("message"):
