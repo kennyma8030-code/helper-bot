@@ -8,11 +8,12 @@ from llm import ask_gemini
 from prompts import CONVO_PROMPT, KICKOFF_PROMPT, fill_prompt
 import random
 from collections import defaultdict
+import time
 
 NUMBER_OF_BOTS = 5
 
-BOT_NAMES = ["Ash", "Blue", "Cleo", "Dot", "Eve"]  # bot number 1..5 -> name
-BOT_ROSTER = ", ".join(f"{i}={name}" for i, name in enumerate(BOT_NAMES, start=1))
+# Bots are identified by number only: 1_bot, 2_bot, ...
+BOT_ROSTER = ", ".join(f"{i}_bot" for i in range(1, NUMBER_OF_BOTS + 1))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -122,7 +123,7 @@ def handler_helper(client, index):
             past_messages.append(f"human: {message.content}")
             prompt = fill_prompt(
                 KICKOFF_PROMPT,
-                bot_name=BOT_NAMES[0], bot_number=1,
+                bot_name="1_bot", bot_number=1,
                 num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
             )
         else:
@@ -139,10 +140,11 @@ def handler_helper(client, index):
                 return
             prompt = fill_prompt(
                 CONVO_PROMPT,
-                bot_name=BOT_NAMES[index - 1], bot_number=index,
+                bot_name=f"{index}_bot", bot_number=index,
                 num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
             )
 
+        await asyncio.sleep(10)
         raw = await ask_gemini(prompt, build_content(index), web_search=False)
         parsed = parse_response(raw)
         if parsed is None or not parsed.get("message"):
@@ -154,7 +156,7 @@ def handler_helper(client, index):
         # Store the response: routing for the next turn, the message into the
         # rolling window, and this bot's private notes if it rewrote them.
         prev_res = parsed
-        past_messages.append(f"{index} {BOT_NAMES[index - 1]}: {parsed['message']}")
+        past_messages.append(f"{index}_bot: {parsed['message']}")
         message_number += 1
         ctx = parsed.get("bot_context") or {}
         if ctx.get("edit_context"):

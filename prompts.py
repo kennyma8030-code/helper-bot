@@ -175,15 +175,14 @@ OUTPUT FORMAT — reply with ONLY this JSON object, no markdown fences, no extra
 
 respond_to = who should reply to the message YOU are sending now. Every key from "0"
 to "{num_bots_plus_1}" must be present with a boolean value. The keys mean:
-- "1" through "{num_bots}": that specific bot should reply. You may set more than one
-  bot to true. NEVER set your own number ("{bot_number}") to true.
+- "1" through "{num_bots}": that specific bot should reply. NEVER set your own
+  number ("{bot_number}") to true.
 - "0": nobody should reply to this message.
-- "{num_bots_plus_1}": exactly one bot, chosen at random by the system, will reply.
+- "{num_bots_plus_1}": one bot, chosen at random by the system, will reply.
 
-HARD RULE: "0" and "{num_bots_plus_1}" are exclusive modes.
-If ANY ONE of them is true, then EVERY other key in respond_to must be false.
-Specific bot numbers may only be true when "0" and "{num_bots_plus_1}" are
-both false.
+HARD RULE: EXACTLY ONE key in respond_to may be true — one specific bot, OR "0"
+(nobody), OR "{num_bots_plus_1}" (random). Every other key must be false. Never
+set two or more keys to true.
 
 bot_context = your private notes:
 - If this turn changed how you feel (about a bot, or in general), set "edit_context":
@@ -211,15 +210,14 @@ OUTPUT FORMAT — reply with ONLY this JSON object, no markdown fences, no extra
 
 respond_to = who should reply to the message YOU are sending now. Every key from "0"
 to "{num_bots_plus_1}" must be present with a boolean value. The keys mean:
-- "1" through "{num_bots}": that specific bot should reply. You may set more than one
-  bot to true. NEVER set your own number ("1") to true.
+- "1" through "{num_bots}": that specific bot should reply. NEVER set your own
+  number ("1") to true.
 - "0": nobody should reply to this message.
-- "{num_bots_plus_1}": exactly one bot, chosen at random by the system, will reply.
+- "{num_bots_plus_1}": one bot, chosen at random by the system, will reply.
 
-HARD RULE: "0" and "{num_bots_plus_1}" are exclusive modes.
-If ANY ONE of them is true, then EVERY other key in respond_to must be false.
-Specific bot numbers may only be true when "0" and "{num_bots_plus_1}" are
-both false.
+HARD RULE: EXACTLY ONE key in respond_to may be true — one specific bot, OR "0"
+(nobody), OR "{num_bots_plus_1}" (random). Every other key must be false. Never
+set two or more keys to true.
 
 bot_context = your private notes about the other bots and the conversation. Since the
 conversation is just starting: if this opening gave you any feelings worth remembering,
