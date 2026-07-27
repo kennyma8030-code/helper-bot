@@ -28,15 +28,40 @@ ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
 
 # Feature switches, toggled by the admin commands below.
-switches = {"bot": False, "RAG": False}
+switches = {"bot": False, "RAG": False, "answer_all": False}
 
-async def _verify(interaction: discord.Interaction, name: str, on: bool) -> bool:
-    """Flip a switch if the caller is the admin. Returns whether it was allowed,
-    so callers with a body of their own can bail on a rejected command."""
+async def _powered_on(interaction: discord.Interaction) -> bool:
+    """The master gate: nothing but /power works while the bot is switched off.
+
+    Sends the refusal itself, so callers only have to bail on False.
+    """
+    if not switches["bot"]:
+        await interaction.response.send_message(
+            "The bot is off — run /power on:True first.", ephemeral=True
+        )
+        return False
+    return True
+
+
+async def _verify(
+    interaction: discord.Interaction,
+    name: str,
+    on: bool,
+    *,
+    require_on: bool = True,
+) -> bool:
+    """Flip a switch if the caller is the admin and the bot is powered on.
+
+    Returns whether it was allowed, so callers with a body of their own can
+    bail on a rejected command. require_on=False is for /power itself, which
+    has to work precisely when the bot is off.
+    """
     if interaction.user.id != ADMIN_USER_ID:
         await interaction.response.send_message(
             "NOT ALOUD!", ephemeral=True
         )
+        return False
+    if require_on and not await _powered_on(interaction):
         return False
     switches[name] = on
     await interaction.response.send_message(
@@ -48,7 +73,23 @@ async def _verify(interaction: discord.Interaction, name: str, on: bool) -> bool
 @tree.command(name="power", description="Turn the bot on or off (admin only).")
 @app_commands.describe(on="True to enable, False to disable")
 async def power(interaction: discord.Interaction, on: bool):
-    await _verify(interaction, "bot", on)
+    if not await _verify(interaction, "bot", on, require_on=False):
+        return
+    if not on:
+        # Powering down clears the modes, so switching back on is a clean slate
+        # rather than whatever was left set from last time.
+        switches["RAG"] = False
+        switches["answer_all"] = False
+        await db.close_pool()
+
+
+@tree.command(
+    name="answer_all",
+    description="Reply to every message, not just questions (admin only).",
+)
+@app_commands.describe(on="True to enable, False to disable")
+async def answer_all(interaction: discord.Interaction, on: bool):
+    await _verify(interaction, "answer_all", on)
 
 
 @tree.command(name="rag", description="Turn RAG on or off (admin only).")
@@ -71,6 +112,8 @@ async def rag(interaction: discord.Interaction, on: bool):
 async def respond(interaction: discord.Interaction, on: bool):
     if interaction.user.id != ADMIN_USER_ID:
         await interaction.response.send_message("NOT ALOUD!", ephemeral=True)
+        return
+    if not await _powered_on(interaction):
         return
     if not on:
         await interaction.response.send_message("Nothing to do.", ephemeral=True)
@@ -104,6 +147,9 @@ async def respond(interaction: discord.Interaction, on: bool):
 @tree.command(name="ask", description="Answer a question from the chat's history.")
 @app_commands.describe(ask="What you want to know")
 async def ask_command(interaction: discord.Interaction, ask: str):
+    if not await _powered_on(interaction):
+        return
+
     # The loop makes many model calls and searches; Discord drops any command
     # that has not replied within 3 seconds. defer() buys 15 minutes.
     await interaction.response.defer(thinking=True)
@@ -139,6 +185,8 @@ async def backfill(
 ):
     if interaction.user.id != ADMIN_USER_ID:
         await interaction.response.send_message("NOT ALOUD!", ephemeral=True)
+        return
+    if not await _powered_on(interaction):
         return
 
     channel = channel or interaction.channel
@@ -213,6 +261,23 @@ async def on_ready():
     print(f"Logged in as {client.user}")
 
 
+async def _reply_if_question(message) -> None:
+    """Answer one message, if the classifier says it's a question.
+
+    Both on_message paths share this so there is a single place the reply is
+    built — the duplicated version of this block is how the target-user check
+    silently became unreachable once before.
+    """
+    # An image-only post has content == "" and is nothing to answer.
+    if not message.content:
+        print("[on_message] ignoring: no text content", flush=True)
+        return
+    answer = await qa.answer_question(message.content, True)
+    if answer is not None:
+        await message.reply(answer)
+        print("[on_message] reply sent", flush=True)
+
+
 @client.event
 async def on_message(message):
     print(f"[on_message] from {message.author} ({message.author.id}): {message.content!r}", flush=True)
@@ -223,13 +288,11 @@ async def on_message(message):
         return
 
     
-    if switches["bot"]:
-        answer = await qa.answer_question(message.content, True)
-        if answer is not None:
-            await message.reply(answer)
-            print("[on_message] reply sent", flush=True)
+    # The master gate: nothing runs while the bot is powered off.
+    if not switches["bot"]:
+        print("[on_message] ignoring: bot is off", flush=True)
         return
-    
+
     if switches["RAG"]:
         await db.upsert_message(
             discord_message_id=message.id,
@@ -242,12 +305,17 @@ async def on_message(message):
             ),
         )
 
+    # answer_all widens the audience to everyone; who gets answered is the only
+    # thing it changes, so the is_question gate still applies on both paths.
+    if switches["answer_all"]:
+        await _reply_if_question(message)
+        return
+
     if message.author.id != TARGET_USER_ID:
         print(f"[on_message] ignoring: not target user (target={TARGET_USER_ID})", flush=True)
         return
 
-    
-   
+    await _reply_if_question(message)
 
 
 if __name__ == "__main__":
