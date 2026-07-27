@@ -71,17 +71,21 @@ async def is_question(message: str) -> bool | None:
     return bool(result["is_question"])
 
 
-async def answer_question(content: str) -> str | None:
+async def answer_question(content: str, classify: bool = True) -> str | None:
     """Full pipeline for one message: classify, answer, style.
 
     Returns the styled reply, or None if the message shouldn't be answered
     (not a question, or the classifier output was unusable).
+
+    classify=False skips the is_question gate and answers unconditionally —
+    for callers where a human already decided this message deserves a reply.
     """
-    verdict = await is_question(content)
-    if not verdict:
-        print("[answer_question] not treated as a question, no reply", flush=True)
-        return None
-    print("[answer_question] is a question, asking gemini for answer...", flush=True)
+    if classify:
+        verdict = await is_question(content)
+        if not verdict:
+            print("[answer_question] not treated as a question, no reply", flush=True)
+            return None
+        print("[answer_question] is a question, asking gemini for answer...", flush=True)
     answer = await ask_gemini(PROMPT1, content)
     print(f"[answer_question] gemini answer: {answer!r}", flush=True)
     answer = style_response(answer)

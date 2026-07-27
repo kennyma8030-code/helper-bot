@@ -38,7 +38,10 @@ log = logging.getLogger(__name__)
 
 # Standard libpq connection string, e.g.
 #   postgresql://user:pass@host:5432/ragbot
-DATABASE_URL = os.environ["DATABASE_URL"]
+# Read but not required at import: bot.py imports this module unconditionally,
+# so demanding the variable here would stop the whole bot from starting on a
+# deploy that has no database. open_pool() is the one place that truly needs it.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # PROVISIONAL. The embedding model is an open question in the design doc
 # (local sentence-transformers vs. an API model). The vector column and its
@@ -134,6 +137,12 @@ async def open_pool() -> AsyncConnectionPool:
     global _pool
     if _pool is not None:
         return _pool
+
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set, so there is no message store to open. "
+            "Set it in the environment and restart."
+        )
 
     pool = AsyncConnectionPool(
         conninfo=DATABASE_URL,

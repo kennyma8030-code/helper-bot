@@ -55,9 +55,6 @@ def _obj(props: dict[str, types.Schema], required: list[str] | None = None) -> t
 _FILTER_PROPS: dict[str, types.Schema] = {
     "author_id": _s("INTEGER", "Only messages sent by this Discord user id"),
     "channel_id": _s("INTEGER", "Only messages in this channel id"),
-    "category": _s("STRING", "Only messages with this ingestion-time category tag"),
-    "sentiment": _s("STRING", "Only messages with this sentiment tag"),
-    "target_person_id": _s("INTEGER", "Only messages classified as being about this user id"),
     "day_of_week": _s("INTEGER", "0=Monday .. 6=Sunday"),
     "hour_of_day": _s("INTEGER", "Hour of day, 0..23 (UTC)"),
     "after": _s("STRING", "Only messages at/after this ISO datetime, e.g. 2026-03-01T00:00:00"),
@@ -78,7 +75,7 @@ TOOLS = types.Tool(function_declarations=[
         parameters=_obj({
             **_FILTER_PROPS,
             "order_by": _s("STRING", "One of: 'created_at DESC' (default), "
-                                     "'created_at ASC', 'author_id', 'category', "
+                                     "'created_at ASC', 'author_id', "
                                      "'id ASC', 'id DESC'"),
             "limit": _LIMIT,
         }),
@@ -124,25 +121,6 @@ TOOLS = types.Tool(function_declarations=[
             "channel_id": _s("INTEGER", "Optionally restrict to one channel"),
             "limit": _LIMIT,
         }, required=["anchor"]),
-    ),
-    types.FunctionDeclaration(
-        name="message_counts_by_author",
-        description=(
-            "Total message count per author under the given filters — the "
-            "denominators. Required before any per-person rate claim."
-        ),
-        parameters=_obj(dict(_FILTER_PROPS)),
-    ),
-    types.FunctionDeclaration(
-        name="category_rate_by_author",
-        description=(
-            "Per-author rate of a category (matching count, total, rate) under "
-            "the given filters. Use for every 'usually / most / how often' "
-            "question — never estimate counts by reading messages."
-        ),
-        parameters=_obj({"category": _s("STRING", "The category tag to rate"),
-                         **_FILTER_PROPS},
-                        required=["category"]),
     ),
 ])
 
@@ -220,10 +198,6 @@ async def _execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]
             channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
             limit=limit,
         )
-    elif name == "message_counts_by_author":
-        rows = await db.message_counts_by_author(filters=filters or None)
-    elif name == "category_rate_by_author":
-        rows = await db.category_rate_by_author(str(rest["category"]), filters=filters or None)
     else:
         raise ValueError(f"unknown tool: {name}")
 
