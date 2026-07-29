@@ -44,7 +44,7 @@ NICK_LOCK_DELAY = 20
 _nick_tasks: dict[int, asyncio.Task] = {}
 
 # Feature switches, toggled by the admin commands below.
-switches = {"bot": False, "RAG": False, "answer_all": False}
+switches = {"bot": False, "RAG": False}
 
 async def _powered_on(interaction: discord.Interaction) -> bool:
     """The master gate: nothing but /power works while the bot is switched off.
@@ -95,17 +95,7 @@ async def power(interaction: discord.Interaction, on: bool):
         # Powering down clears the modes, so switching back on is a clean slate
         # rather than whatever was left set from last time.
         switches["RAG"] = False
-        switches["answer_all"] = False
         await db.close_pool()
-
-
-@tree.command(
-    name="answer_all",
-    description="Reply to every message, not just questions (admin only).",
-)
-@app_commands.describe(on="True to enable, False to disable")
-async def answer_all(interaction: discord.Interaction, on: bool):
-    await _verify(interaction, "answer_all", on)
 
 
 @tree.command(name="rag", description="Turn RAG on or off (admin only).")
@@ -326,23 +316,6 @@ async def on_ready():
     print(f"Logged in as {client.user}")
 
 
-async def _reply_if_question(message) -> None:
-    """Answer one message, if the classifier says it's a question.
-
-    Both on_message paths share this so there is a single place the reply is
-    built — the duplicated version of this block is how the target-user check
-    silently became unreachable once before.
-    """
-    # An image-only post has content == "" and is nothing to answer.
-    if not message.content:
-        print("[on_message] ignoring: no text content", flush=True)
-        return
-    answer = await qa.answer_question(message.content, True)
-    if answer is not None:
-        await message.reply(answer)
-        print("[on_message] reply sent", flush=True)
-
-
 @client.event
 async def on_message(message):
     print(f"[on_message] from {message.author} ({message.author.id}): {message.content!r}", flush=True)
@@ -370,17 +343,8 @@ async def on_message(message):
             ),
         )
 
-    # answer_all widens the audience to everyone; who gets answered is the only
-    # thing it changes, so the is_question gate still applies on both paths.
-    if switches["answer_all"]:
-        await _reply_if_question(message)
-        return
-
-    if message.author.id != TARGET_USER_ID:
-        print(f"[on_message] ignoring: not target user (target={TARGET_USER_ID})", flush=True)
-        return
-
-    await _reply_if_question(message)
+    # No answering happens here. on_message only records messages for RAG;
+    # replies are sent by /respond and /ask, on the admin's explicit request.
 
 
 if __name__ == "__main__":

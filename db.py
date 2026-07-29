@@ -112,6 +112,67 @@ CREATE INDEX IF NOT EXISTS messages_embedding_idx
 
 -- TODO: keyword_search() uses ILIKE for now. For real term/name matching add
 -- a pg_trgm GIN index or a tsvector column; embeddings are weak on exact names.
+
+-- LLM-written summaries: the retrieval index over the corpus (specs-summaries.md).
+-- Derived and regenerable — messages are the ground truth, these are a lossy
+-- pointer layer. Facts cite message ids, never summary ids.
+--
+-- One table holds both tiers: whole days, and sub-summaries of dense stretches
+-- within a day. granularity + parent_id keep reads from special-casing tiers.
+CREATE TABLE IF NOT EXISTS day_summaries (
+    id                  bigserial PRIMARY KEY,
+
+    summary_date        date        NOT NULL,
+    channel_id          bigint      NOT NULL,
+
+    -- 'day' = the whole date; 'session' = one dense stretch inside that date.
+    granularity         text        NOT NULL DEFAULT 'day',
+    -- Set on session rows only; the day summary they were split out of.
+    parent_id           bigint      REFERENCES day_summaries(id) ON DELETE CASCADE,
+
+    -- Actual span covered. Needed for sessions, where the date alone does not
+    -- locate the summary; on day rows it is the first/last message timestamp.
+    started_at          timestamptz NOT NULL,
+    ended_at            timestamptz NOT NULL,
+
+    prose               text        NOT NULL,   -- read once a span is chosen
+    facets              jsonb       NOT NULL DEFAULT '{{}}'::jsonb,  -- searchable
+
+    -- Drill-down range: any summary expands to exactly the rows behind it.
+    first_message_id    bigint      NOT NULL,   -- discord_message_id
+    last_message_id     bigint      NOT NULL,
+    message_count       integer     NOT NULL,
+
+    -- Regeneration bookkeeping: the prompt and model will both change.
+    model               text        NOT NULL,
+    prompt_version      text        NOT NULL,
+    generated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+-- Upsert keys, split by tier: one summary per (day, channel), but a day may
+-- hold many sessions. Partial unique indexes let each tier have its own
+-- ON CONFLICT target while sharing the table.
+CREATE UNIQUE INDEX IF NOT EXISTS day_summaries_day_key
+    ON day_summaries (summary_date, channel_id) WHERE granularity = 'day';
+CREATE UNIQUE INDEX IF NOT EXISTS day_summaries_session_key
+    ON day_summaries (parent_id, started_at)    WHERE granularity = 'session';
+
+CREATE INDEX IF NOT EXISTS day_summaries_date_idx   ON day_summaries (channel_id, summary_date);
+CREATE INDEX IF NOT EXISTS day_summaries_parent_idx ON day_summaries (parent_id);
+-- Entity/topic lookup without reading every summary. jsonb_path_ops is the
+-- smaller, faster operator class; it supports @> containment, which is the
+-- only facet query we need.
+CREATE INDEX IF NOT EXISTS day_summaries_facets_idx
+    ON day_summaries USING gin (facets jsonb_path_ops);
+
+-- Watermark for incremental summarization: how far each channel is caught up.
+-- Lets the job run on startup/timer and be safe to call repeatedly, with no
+-- cron service and no gap to repair after downtime.
+CREATE TABLE IF NOT EXISTS summary_state (
+    channel_id          bigint      PRIMARY KEY,
+    summarized_through  date        NOT NULL,
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
 """
 
 
