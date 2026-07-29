@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import discord
@@ -9,10 +10,11 @@ import qa
 
 load_dotenv()
 
-# message_content is a privileged intent — enable it in the Discord
-# Developer Portal (Bot > Privileged Gateway Intents) as well.
+# message_content and members are privileged intents — enable them in the
+# Discord Developer Portal (Bot > Privileged Gateway Intents) as well.
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -26,6 +28,20 @@ ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
 # Optional: a guild ID to sync commands to instantly (dev). If unset, commands
 # sync globally, which can take up to an hour to appear.
 GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
+
+# Nickname lock: this user's nickname gets put back to NICK_LOCK_NAME shortly
+# after they change it. Both must be set for the feature to do anything.
+NICK_LOCK_USER_ID = (
+    int(os.environ["NICK_LOCK_USER_ID"]) if os.environ.get("NICK_LOCK_USER_ID") else None
+)
+NICK_LOCK_NAME = os.environ.get("NICK_LOCK_NAME", "")
+
+# How long the new nickname is allowed to stand before it goes back.
+NICK_LOCK_DELAY = 20
+
+# At most one pending reset per user. Renaming repeatedly during the countdown
+# would otherwise stack up timers that all fire at once at the end.
+_nick_tasks: dict[int, asyncio.Task] = {}
 
 # Feature switches, toggled by the admin commands below.
 switches = {"bot": False, "RAG": False, "answer_all": False}
@@ -247,6 +263,55 @@ async def backfill(
 
     await progress(
         f"Backfilled {channel.mention}: {stored} stored, {scanned} scanned."
+    )
+
+
+async def _reset_nick_later(member: discord.Member) -> None:
+    """Wait out the delay, then put the nickname back."""
+    try:
+        await asyncio.sleep(NICK_LOCK_DELAY)
+        await member.edit(nick=NICK_LOCK_NAME)
+        print(f"[nick_lock] reset {member.id} to {NICK_LOCK_NAME!r}", flush=True)
+    except discord.Forbidden:
+        # Either the bot lacks Manage Nicknames, or the target outranks it.
+        # Discord never lets anyone rename the server owner.
+        print("[nick_lock] not allowed to rename that member", flush=True)
+    except discord.HTTPException as e:
+        print(f"[nick_lock] reset failed: {e}", flush=True)
+    finally:
+        # Only clear the slot if it is still ours — a newer rename may have
+        # cancelled this task and put its own there.
+        if _nick_tasks.get(member.id) is asyncio.current_task():
+            _nick_tasks.pop(member.id, None)
+
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if not (NICK_LOCK_USER_ID and NICK_LOCK_NAME):
+        return
+    if after.id != NICK_LOCK_USER_ID:
+        return
+    # This event also fires for role, timeout, and avatar changes.
+    if before.nick == after.nick:
+        return
+    # Our own reset fires this event again; stop there rather than rescheduling
+    # forever.
+    if after.nick == NICK_LOCK_NAME:
+        return
+    if not switches["bot"]:
+        print("[nick_lock] ignoring: bot is off", flush=True)
+        return
+
+    # A second rename during the countdown replaces the pending reset rather
+    # than adding another one.
+    pending = _nick_tasks.get(after.id)
+    if pending:
+        pending.cancel()
+    _nick_tasks[after.id] = asyncio.create_task(_reset_nick_later(after))
+    print(
+        f"[nick_lock] {after.id} renamed to {after.nick!r}, "
+        f"resetting in {NICK_LOCK_DELAY}s",
+        flush=True,
     )
 
 
