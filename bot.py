@@ -37,7 +37,7 @@ NICK_LOCK_USER_ID = (
 NICK_LOCK_NAME = os.environ.get("NICK_LOCK_NAME", "")
 
 # How long the new nickname is allowed to stand before it goes back.
-NICK_LOCK_DELAY = 20
+NICK_LOCK_DELAY = 200
 
 # At most one pending reset per user. Renaming repeatedly during the countdown
 # would otherwise stack up timers that all fire at once at the end.
