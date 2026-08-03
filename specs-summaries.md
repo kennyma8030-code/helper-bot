@@ -1,25 +1,29 @@
 # Day Summaries — Spec
 
-Replaces vector search with two retrieval paths: exact/keyword match over raw
-messages, and LLM-written daily summaries that act as an index into the corpus.
+Adds a third retrieval path alongside the existing two: LLM-written daily
+summaries that act as an index into the corpus, sitting next to exact/keyword
+match over raw messages and metadata-filtered vector search.
 
-Rationale: the embedding pipeline was never built — `set_embedding()` has no
-caller, so every `similarity_search()` matches zero rows. At 3-person volume,
-a day-level summary index is cheaper to build, inspectable when it goes wrong,
-and regenerable when the prompt changes.
+Rationale: the embedding pipeline was never built — `set_embedding()`
+(`db.py:321`) has no caller, so every `similarity_search()` currently matches
+zero rows. At 3-person volume, a day-level summary index is cheaper to build,
+inspectable when it goes wrong, and regenerable when the prompt changes — so
+summaries are the near-term bet and land first. The vector path is not
+removed; it is finished (build order step 4) and kept as the last-resort
+instrument it was always specced to be.
 
-## Supersedes
+## Relationship to specs.md
 
-These `[v1]` items in `specs.md` Part 2 are void:
+Nothing in `specs.md` is void. These `[v1]` items stand as written:
 
 - Metadata-filtered vector search
-- pgvector (extension stays only if something else needs it)
+- pgvector
 - HNSW indexing
-- Multiple embedding spaces / cross-encoder reranking (already `[later]`,
-  now out of scope entirely)
 
-Everything else in `specs.md` stands — the loop, ledger, budgets, and triage
-are unchanged by this.
+Still `[later]`, unchanged: multiple embedding spaces / cross-encoder
+reranking.
+
+The loop, ledger, budgets, and triage are unchanged by this.
 
 ## Decisions
 
@@ -59,6 +63,70 @@ are unchanged by this.
 
 8. **The summarizer sees the previous few days.** Otherwise references like
    "the trip" or "he" are unresolvable and summaries continue nothing.
+
+9. **Summaries and vector search are different instruments, both kept.**
+   Summaries answer "which days are worth reading" — coarse, time-addressed,
+   entity-dense. Vector search answers "which individual message means roughly
+   this" — fine-grained, and the only path that survives when the summary
+   dropped the detail being asked about (see Limitations). `PLANNER_PROMPT`'s
+   preference list gains summaries as a new entry — structured filters,
+   keyword, anchors, summaries, similarity last — and item 4's existing
+   "last resort" framing for similarity is kept verbatim. What changes for
+   similarity search is only that it stops being a no-op.
+
+10. **A dead tool must never look like an empty result.** Until the backfill
+    has run, `similarity_search` returning nothing is indistinguishable from
+    "no messages match" — the model ledgers a false dead branch. Any search
+    over an unpopulated index reports coverage explicitly ("0 of N messages
+    embedded") rather than an empty row list.
+
+## Limitations of LLM summaries
+
+What this approach cannot do — the reason the vector path is kept rather than
+deleted, and the list to re-read when summary retrieval disappoints.
+
+1. **Compression is lossy, and the loss is chosen before the question
+   exists.** A summary is written once and must serve every future question.
+   Whatever the summarizer judged unimportant in March is unrecoverable from
+   the summary in July. Vector search is the opposite trade: it compresses
+   nothing and decides relevance at question time.
+
+2. **Absence in a summary is not absence in the corpus.** This breaks exactly
+   the questions that feel easiest — "has anyone ever mentioned X", "when did
+   we stop talking about Y". A summary index can support "yes, here", never
+   "no, never." Only a full scan (keyword) can answer negatives, and the
+   planner must not read a summary miss as a dead branch.
+
+3. **The summarizer can be wrong in ways nothing catches.** It can merge two
+   conversations, attribute a statement to the wrong person, or assert
+   something plausible that no message says. A wrong summary looks exactly
+   like a right one. This is what decision 2 exists to contain: summaries
+   route, raw messages testify.
+
+4. **Sarcasm flattens into fact.** `PLANNER_PROMPT` already warns that this
+   chat is joke-heavy. A summarizer compressing "we're definitely selling the
+   car" writes down a decision that was never made — and unlike a raw message,
+   the summary carries no tone for the planner to be suspicious of.
+
+5. **Entity-resolution errors become authoritative.** Decision 8 gives the
+   summarizer prior days so pronouns resolve; when it resolves one wrong, the
+   error is baked into `facets` and looks like structured ground truth. Bad
+   entries in `aliases_observed` are self-reinforcing.
+
+6. **Granularity is uniform; conversation is not.** A 500-message day and a
+   5-message day get one summary each. Detail loss scales with how much
+   actually happened, so the busiest days — usually the ones worth
+   asking about — are the most compressed. (Deferred: `needs_detail`.)
+
+7. **Day boundaries cut real threads.** A conversation running past midnight
+   is split across two summaries, neither coherent. No timezone choice
+   removes this; it only moves the cut (see Open).
+
+8. **Regeneration cost is recurring, not one-time.** Every prompt or model
+   change invalidates the corpus, and re-summarizing all history is an LLM
+   call per day per channel. Between changes the corpus is heterogeneous —
+   which is what decision 5's `prompt_version` is for, and why partial
+   regeneration is normal rather than exceptional.
 
 ## Schema
 
@@ -100,43 +168,79 @@ Facets shape (all optional, all arrays unless noted):
   "topics": ["trip planning", "rent"],
   "decisions": [{"what": "trip moved to may", "msg_ids": [123, 456]}],
   "open_threads": ["who is fronting the deposit"],
+  "continues_from": ["cabin dates, left unfixed on the 14th"],
   "aliases_observed": {"222": ["chris", "kris"]}
 }
 ```
 
+`open_threads` and `continues_from` are the pair that make a conversation
+spanning midnight followable: a day records what it left hanging, and the next
+day — which receives the previous week of summaries as context — records what
+it picked back up.
+
 ## Build order
 
-1. **Delete the vector path.** `similarity_search` + `set_embedding` from
-   `db.py`; `_embed_query`, `EMBED_MODEL`, and the `similarity_search` tool
-   declaration from `loop.py`; the `embedding` column, HNSW index, and
-   `EMBED_DIM`/`DISTANCE_OP` from the schema; item 4 of the tool preference
-   list in `PLANNER_PROMPT`.
+Summaries land first — they are the cheaper bet and the thing that is
+actually missing. The vector path is unblocked after, not deleted.
 
-2. **Summaries table + generation job.** Schema above, a
+1. **Summaries table + generation job.** Schema above, a
    `summarize_day(date, channel_id)` that returns prose + facets, the
    watermark loop, and a backfill that runs it over existing history.
 
-3. **`read_summaries` tool.** One new entry in `TOOLS` taking a date range and
+2. **`read_summaries` tool.** One new entry in `TOOLS` taking a date range and
    optional channel, returning summaries for that span. This is where it
    becomes clear whether the summaries are good enough to retrieve on.
 
-4. **Report match counts.** Every search in `_execute_call` caps at 30 rows
+3. **Stop the vector path lying.** Cheap and independent of everything else:
+   implement decision 10, so `similarity_search` over an unembedded corpus
+   reports its coverage instead of returning an empty row list the model reads
+   as "nothing matched."
+
+4. **Finish the vector path.** Everything is in place except the one thing
+   that makes it work: `set_embedding` (`db.py:321`) has no caller. Write the
+   embedding job — a backfill over existing history plus an ongoing pass for
+   new messages, batched, resumable, and driven off `embedding IS NULL` so it
+   is safe to re-run. Two things must be settled first, because changing
+   either invalidates every stored vector: pin the embedding model (`EMBED_DIM`
+   at `db.py:50` is provisional at 768 and must match the chosen model's real
+   output width, which `_embed_query` in `loop.py:132` already requests via
+   `output_dimensionality`), and confirm `DISTANCE_OP` (`db.py:54`, currently
+   cosine `<=>`) matches how that model normalizes.
+
+5. **Report match counts.** Every search in `_execute_call` caps at 30 rows
    (`MAX_ROWS_PER_CALL`) with no signal that more existed. Run `COUNT(*)`
    alongside each query and include `matched` vs `returned` in what
    `_render_results` sends back.
 
-5. **Validate citation ids.** `Ledger.apply` checks only that `citations` is a
+6. **Validate citation ids.** `Ledger.apply` checks only that `citations` is a
    non-empty dict, never that the ids are real. Check against `messages` and
    reject on miss (this is what makes decision 2 enforceable).
 
-Steps 4 and 5 are independent of 1–3 and can land in any order.
+Steps 3, 5, and 6 are independent of everything else and can land in any
+order. Step 4 depends only on step 3 being the honest fallback in the
+meantime.
 
 ## Open
 
-- **Timezone for day boundaries.** Storage is `timestamptz` and `_as_utc()`
-  normalizes to UTC, but `db.py` describes `hour_of_day` as "in the corpus
-  tz". Bucketing on UTC splits late-night conversations across two summaries.
-  Pick the group's local zone and commit it to a constant.
+- ~~**Timezone for day boundaries.**~~ **Settled: US Eastern.** `CORPUS_TZ` in
+  `db.py` (`America/New_York`, env-overridable) is the single clock the corpus
+  is stated in — it cuts the summary day *and* derives `hour_of_day` /
+  `day_of_week` at ingest, which were previously UTC despite the schema
+  claiming otherwise. `America/New_York` rather than a fixed -5 EST, so the
+  buckets track DST the way the group's clocks do. Changing it later
+  invalidates every stored bucket and every summary, since the boundaries
+  themselves move.
+
+- **Which embedding model.** Blocks build order step 4 and nothing else.
+  `EMBED_DIM` (`db.py:50`) is a provisional 768 and `DISTANCE_OP` (`db.py:54`)
+  a provisional cosine; both are properties of the model, not choices to make
+  independently. Pinning this late is fine — pinning it twice is not, since
+  the second choice means re-embedding the whole corpus.
+
+- **Whether to embed summaries too.** `prose` is exactly the kind of text
+  embeddings are good at, and a vector index over summaries would be a
+  cheaper, coarser semantic search than one over every message. Not decided;
+  revisit once step 4 has run and both paths are real.
 
 ## Deferred — with triggers
 

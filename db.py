@@ -24,12 +24,15 @@ Nothing here decides the questions the doc leaves open. In particular:
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Optional, Sequence
 
 from dotenv import load_dotenv
 from pgvector.psycopg import register_vector_async
+from psycopg import AsyncConnection
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 load_dotenv()
@@ -42,6 +45,16 @@ log = logging.getLogger(__name__)
 # so demanding the variable here would stop the whole bot from starting on a
 # deploy that has no database. open_pool() is the one place that truly needs it.
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# The group's own timezone — the one clock every derived time value is stated
+# in. Timestamps stay UTC in the column; this is only for the human-facing
+# buckets (hour_of_day, day_of_week) and for where the summarizer cuts a day.
+#
+# "America/New_York", not a fixed -5 EST: the group's clocks move with DST, so
+# a fixed offset would put every derived hour off by one for two thirds of the
+# year. Changing this invalidates every stored hour_of_day/day_of_week and
+# every day summary, since the boundaries themselves move.
+CORPUS_TZ = ZoneInfo(os.environ.get("CORPUS_TZ", "America/New_York"))
 
 # PROVISIONAL. The embedding model is an open question in the design doc
 # (local sentence-transformers vs. an API model). The vector column and its
@@ -80,7 +93,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
     -- Derived-at-ingest temporal buckets for pattern/aggregation queries.
     day_of_week         smallint    NOT NULL,   -- 0=Monday .. 6=Sunday
-    hour_of_day         smallint    NOT NULL,   -- 0..23, in the corpus tz
+    hour_of_day         smallint    NOT NULL,   -- 0..23, in CORPUS_TZ
 
     -- Ingestion-time classification. Nullable and untrusted (see module doc).
     category            text,                   -- e.g. proposal/complaint/...
@@ -173,6 +186,15 @@ CREATE TABLE IF NOT EXISTS summary_state (
     summarized_through  date        NOT NULL,
     updated_at          timestamptz NOT NULL DEFAULT now()
 );
+
+-- Durable feature switches. The bot keeps these in memory to read them for
+-- free, but the container is rebuilt on every deploy, crash, and restart, so
+-- the in-memory copy is a cache and this table is the truth.
+CREATE TABLE IF NOT EXISTS settings (
+    key                 text        PRIMARY KEY,
+    value               boolean     NOT NULL,
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
 """
 
 
@@ -186,6 +208,24 @@ _pool: Optional[AsyncConnectionPool] = None
 async def _configure(conn) -> None:
     """Per-connection setup: teach psycopg how to adapt pgvector types."""
     await register_vector_async(conn)
+
+
+async def _ensure_vector_extension() -> None:
+    """Create the vector extension before the pool exists.
+
+    Ordering trap: _configure registers pgvector's types on every pooled
+    connection, and that registration fails with "vector type not found in the
+    database" if the extension is not there yet — which is exactly the state of
+    a fresh database, since init_db() has not run. Every connection then fails
+    to configure, the pool never fills, and it surfaces as a PoolTimeout that
+    says nothing about vectors.
+
+    So this runs first, on one plain connection with no configure hook. It is
+    also where a Postgres image genuinely lacking pgvector reports itself, with
+    an error naming the extension instead of a 30-second timeout.
+    """
+    async with await AsyncConnection.connect(DATABASE_URL, autocommit=True) as conn:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
 
 async def open_pool() -> AsyncConnectionPool:
@@ -204,6 +244,8 @@ async def open_pool() -> AsyncConnectionPool:
             "DATABASE_URL is not set, so there is no message store to open. "
             "Set it in the environment and restart."
         )
+
+    await _ensure_vector_extension()
 
     pool = AsyncConnectionPool(
         conninfo=DATABASE_URL,
@@ -262,13 +304,16 @@ async def upsert_message(
 ) -> int:
     """Insert a message (or update it if already ingested). Returns the row id.
 
-    day_of_week / hour_of_day are derived here from created_at. Classification
-    and embedding are optional so ingestion, classification, and embedding can
-    be separate passes (keeps backfill/embedding strategy open).
+    day_of_week / hour_of_day are derived here from created_at, in CORPUS_TZ —
+    they exist to answer "who posts late at night", and that question is about
+    the group's clock, not the server's. The timestamp itself stays UTC.
+    Classification and embedding are optional so ingestion, classification, and
+    embedding can be separate passes (keeps backfill/embedding strategy open).
     """
     created_at = _as_utc(created_at)
-    day_of_week = created_at.weekday()          # 0=Monday
-    hour_of_day = created_at.hour
+    local = created_at.astimezone(CORPUS_TZ)
+    day_of_week = local.weekday()               # 0=Monday
+    hour_of_day = local.hour
 
     sql = """
         INSERT INTO messages (
@@ -298,6 +343,35 @@ async def upsert_message(
     return row["id"]
 
 
+async def known_channel_ids() -> list[int]:
+    """Every channel the store already holds messages for.
+
+    This is what the startup catch-up walks: a channel enters the corpus by
+    being backfilled once, deliberately, and is kept current from then on.
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT DISTINCT channel_id FROM messages")
+        rows = await cur.fetchall()
+    return [row["channel_id"] for row in rows]
+
+
+async def last_message_id(channel_id: int) -> Optional[int]:
+    """Highest stored discord_message_id for a channel, or None if empty.
+
+    Discord ids are snowflakes — they increase with time — so this doubles as
+    "how far this channel is caught up", and anything above it is new.
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT MAX(discord_message_id) AS last FROM messages WHERE channel_id = %s",
+            (channel_id,),
+        )
+        row = await cur.fetchone()
+    return row["last"] if row else None
+
+
 async def set_classification(
     discord_message_id: int,
     *,
@@ -325,6 +399,34 @@ async def set_embedding(discord_message_id: int, embedding: Sequence[float]) -> 
         await conn.execute(
             "UPDATE messages SET embedding = %s WHERE discord_message_id = %s",
             (embedding, discord_message_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Settings — switches that have to outlive the process
+# ---------------------------------------------------------------------------
+
+async def get_switches() -> dict[str, bool]:
+    """Every stored switch. A switch that has never been set is simply absent,
+    so the caller keeps its own default rather than getting a false here."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT key, value FROM settings")
+        rows = await cur.fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+async def set_switch(key: str, value: bool) -> None:
+    """Persist one switch. Upsert, so no row has to be seeded first."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE
+               SET value = EXCLUDED.value, updated_at = now()
+            """,
+            (key, value),
         )
 
 
@@ -549,6 +651,164 @@ async def category_rate_by_author(
     async with pool.connection() as conn:
         cur = await conn.execute(sql, [category, *params, category])
         return await cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Day summaries: the retrieval index over the corpus (specs-summaries.md)
+# ---------------------------------------------------------------------------
+# Derived and regenerable. Messages stay the ground truth; these are a lossy
+# pointer layer, which is why nothing here ever replaces a message read.
+
+async def messages_for_span(
+    channel_id: int,
+    start: datetime,
+    end: datetime,
+    *,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Every message in one channel from start (inclusive) to end (exclusive),
+    oldest first — the raw input to one summary.
+
+    The limit is a blast radius, not a page size: a day that hits it is a day
+    the summarizer is seeing only part of, and the caller should say so.
+    """
+    sql = """
+        SELECT * FROM messages
+         WHERE channel_id = %s AND created_at >= %s AND created_at < %s
+      ORDER BY created_at ASC
+         LIMIT %s
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(sql, (channel_id, _as_utc(start), _as_utc(end), limit))
+        return await cur.fetchall()
+
+
+async def first_message_at(channel_id: int) -> Optional[datetime]:
+    """Timestamp of the oldest stored message in a channel, or None if empty.
+
+    Where summarization starts when a channel has no watermark yet.
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT MIN(created_at) AS first FROM messages WHERE channel_id = %s",
+            (channel_id,),
+        )
+        row = await cur.fetchone()
+    return row["first"] if row else None
+
+
+async def upsert_day_summary(
+    *,
+    summary_date: date,
+    channel_id: int,
+    started_at: datetime,
+    ended_at: datetime,
+    prose: str,
+    facets: dict[str, Any],
+    first_message_id: int,
+    last_message_id: int,
+    message_count: int,
+    model: str,
+    prompt_version: str,
+) -> int:
+    """Write one day's summary, replacing any existing row for that day.
+
+    Upsert rather than insert so re-running a day — after a prompt change, or
+    after a backfill filled in messages that were missing the first time — is
+    a normal operation instead of a duplicate-key error.
+    """
+    sql = """
+        INSERT INTO day_summaries (
+            summary_date, channel_id, granularity,
+            started_at, ended_at, prose, facets,
+            first_message_id, last_message_id, message_count,
+            model, prompt_version
+        )
+        VALUES (%s, %s, 'day', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (summary_date, channel_id) WHERE granularity = 'day'
+        DO UPDATE SET
+            started_at       = EXCLUDED.started_at,
+            ended_at         = EXCLUDED.ended_at,
+            prose            = EXCLUDED.prose,
+            facets           = EXCLUDED.facets,
+            first_message_id = EXCLUDED.first_message_id,
+            last_message_id  = EXCLUDED.last_message_id,
+            message_count    = EXCLUDED.message_count,
+            model            = EXCLUDED.model,
+            prompt_version   = EXCLUDED.prompt_version,
+            generated_at     = now()
+        RETURNING id
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(sql, (
+            summary_date, channel_id,
+            _as_utc(started_at), _as_utc(ended_at),
+            prose, Jsonb(facets),
+            first_message_id, last_message_id, message_count,
+            model, prompt_version,
+        ))
+        row = await cur.fetchone()
+    return row["id"]
+
+
+async def recent_day_summaries(
+    channel_id: int,
+    *,
+    before: date,
+    days: int = 7,
+) -> list[dict[str, Any]]:
+    """The `days` day-summaries immediately preceding `before`, oldest first.
+
+    This is the summarizer's whole memory of what came before — enough to
+    resolve "the trip" and "he", and to carry an unresolved thread forward.
+    Oldest first because that is the order it happened in.
+    """
+    sql = """
+        SELECT * FROM (
+            SELECT * FROM day_summaries
+             WHERE channel_id = %s
+               AND granularity = 'day'
+               AND summary_date < %s
+          ORDER BY summary_date DESC
+             LIMIT %s
+        ) recent
+      ORDER BY summary_date ASC
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(sql, (channel_id, before, days))
+        return await cur.fetchall()
+
+
+async def summary_watermark(channel_id: int) -> Optional[date]:
+    """Last date this channel is summarized through, or None if never run."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT summarized_through FROM summary_state WHERE channel_id = %s",
+            (channel_id,),
+        )
+        row = await cur.fetchone()
+    return row["summarized_through"] if row else None
+
+
+async def set_summary_watermark(channel_id: int, through: date) -> None:
+    """Advance the watermark. Only ever moves forward, so an out-of-order or
+    repeated run cannot rewind a channel and cause days to be redone."""
+    sql = """
+        INSERT INTO summary_state (channel_id, summarized_through)
+        VALUES (%s, %s)
+        ON CONFLICT (channel_id) DO UPDATE
+           SET summarized_through = GREATEST(summary_state.summarized_through,
+                                             EXCLUDED.summarized_through),
+               updated_at = now()
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(sql, (channel_id, through))
 
 
 # ---------------------------------------------------------------------------
