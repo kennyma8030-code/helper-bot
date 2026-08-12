@@ -50,6 +50,7 @@ def _obj(props: dict[str, types.Schema], required: list[str] | None = None) -> t
     return types.Schema(type="OBJECT", properties=props, required=required or [])
 
 
+
 # Shared filter params; the schema (not prose) is what teaches the model
 # which columns are filterable.
 _FILTER_PROPS: dict[str, types.Schema] = {
@@ -294,23 +295,23 @@ class Ledger:
                 for c in i["competing"]:
                     lines.append(f"      competing: {c}")
         if self.open_questions:
-            lines.append("OPEN QUESTIONS:")
-            lines.extend(f"  - {q}" for q in self.open_questions)
-        if self.dead_branches:
-            lines.append("DEAD BRANCHES:")
-            lines.extend(f"  - {b}" for b in self.dead_branches)
-        return "\n".join(lines)
+        lines.append("OPEN QUESTIONS:")
+        lines.extend(f"  - {q}" for q in self.open_questions)
+    if self.dead_branches:
+        lines.append("DEAD BRANCHES:")
+        lines.extend(f"  - {b}" for b in self.dead_branches)
+    return "\n".join(lines)
 
 
 @dataclass
 class Investigation:
-    question: str
-    route: str
-    ledger: Ledger
-    verdict: str          # yes | unanswerable | stalled | budget_exhausted
-    passes: int
-    retrievals: int
-    trajectory: list[dict[str, Any]] = field(default_factory=list)
+question: str
+route: str
+ledger: Ledger
+verdict: str          # yes | unanswerable | stalled | budget_exhausted
+passes: int
+retrievals: int
+trajectory: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +319,8 @@ class Investigation:
 # ---------------------------------------------------------------------------
 
 def _extract_json(text: str) -> dict[str, Any] | None:
-    """First parseable JSON object anywhere in the text (fence-tolerant)."""
-    decoder = json.JSONDecoder()
+"""First parseable JSON object anywhere in the text (fence-tolerant)."""
+decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
         if ch == "{":
             try:
@@ -470,7 +471,7 @@ async def investigate(
 # Triage and synthesis
 # ---------------------------------------------------------------------------
 
-async def triage(question: str) -> str:
+async def triage(question: str) -> str: ###changed###
     """Route a question: 'lookup' or 'investigation'. Defaults to investigation."""
     try:
         raw = await ask_gemini(TRIAGE_PROMPT, question, model=MODEL, web_search=False)
@@ -497,14 +498,7 @@ async def synthesize(inv: Investigation) -> str:
 
 async def answer(question: str) -> str:
     """Full pipeline: triage -> investigate -> synthesize. The bot.py seam."""
-    route = await triage(question)
-    if route == "lookup":
-        inv = await investigate(
-            question, route=route,
-            max_passes=LOOKUP_MAX_PASSES, max_retrievals=LOOKUP_MAX_RETRIEVALS,
-        )
-    else:
-        inv = await investigate(question, route=route)
+    inv = await investigate(question, route=route)
     log.info("investigation done: route=%s verdict=%s passes=%d retrievals=%d",
              route, inv.verdict, inv.passes, inv.retrievals)
     return await synthesize(inv)
