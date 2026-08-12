@@ -1,34 +1,10 @@
 """Role prompts for the agent loop (see specs.md Part 1).
 
 Kept separate from loop.py so the control flow stays readable. Each prompt
-is the system instruction for one role-scoped call: triage routes, the
-planner plans+judges each pass, synthesis writes the final answer from the
-ledger alone.
+is the system instruction for one role-scoped call: the planner plans+judges
+each pass, synthesis writes the final answer from the ledger alone.
 
 Also holds the multi-bot conversation prompts used by test.py (bottom of file).
-"""
-
-TRIAGE_PROMPT = """You route questions about a Discord group chat's history.
-
-Classify the question into exactly one route:
-
-- "lookup": answerable by a single retrieval — one specific message, fact, or
-  link is being asked for, and a direct search will surface it.
-  Examples: "what was the address chris sent", "find the zillow listing from
-  last month", "when is game night this week"
-
-- "investigation": needs multiple dependent retrievals — the evidence is
-  scattered, may need cross-checking, aggregation, tracking changes over
-  time, or the answer may not exist in the chat at all.
-  Examples: "do my friends still like hiking", "did anyone ever pay me back",
-  "what did we finally decide about the cabin trip"
-
-When unsure, choose "investigation" — a wrongly-escalated lookup costs a few
-extra calls; a wrongly-simplified investigation gives a confidently wrong
-answer.
-
-Respond with only a JSON object, no other text:
-{"route": "lookup" or "investigation"}
 """
 
 PLANNER_PROMPT = """You are the reasoning core of a bot that answers questions

@@ -1,6 +1,6 @@
 """Core agent loop — LLM-directed retrieval over the message store (specs.md Part 1).
 
-Shape: triage -> budgeted while loop (plan+judge per pass) -> synthesize.
+Shape: budgeted while loop (plan+judge per pass) -> synthesize.
 One model, role-scoped prompts, native function calling with manual dispatch.
 State lives in an append-only ledger; raw rows live for exactly one pass.
 
@@ -18,7 +18,7 @@ from google.genai import types
 
 import db
 from llm import ask_gemini, client
-from prompts import PLANNER_PROMPT, SYNTH_PROMPT, TRIAGE_PROMPT
+from prompts import PLANNER_PROMPT, SYNTH_PROMPT
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +28,6 @@ EMBED_MODEL = "gemini-embedding-001"
 # Hard budget — enforced in code, not by the prompt (specs.md decision 2).
 MAX_PASSES = 16
 MAX_RETRIEVALS = 40
-
-# Lookup fast path: same loop, tiny budget (specs.md decision 6).
-LOOKUP_MAX_PASSES = 3
-LOOKUP_MAX_RETRIEVALS = 6
 
 # Rows are context we pay for on every subsequent token — keep result sets small.
 MAX_ROWS_PER_CALL = 30
@@ -295,23 +291,23 @@ class Ledger:
                 for c in i["competing"]:
                     lines.append(f"      competing: {c}")
         if self.open_questions:
-        lines.append("OPEN QUESTIONS:")
-        lines.extend(f"  - {q}" for q in self.open_questions)
-    if self.dead_branches:
-        lines.append("DEAD BRANCHES:")
-        lines.extend(f"  - {b}" for b in self.dead_branches)
-    return "\n".join(lines)
+            lines.append("OPEN QUESTIONS:")
+            lines.extend(f"  - {q}" for q in self.open_questions)
+        if self.dead_branches:
+            lines.append("DEAD BRANCHES:")
+            lines.extend(f"  - {b}" for b in self.dead_branches)
+        return "\n".join(lines)
 
 
 @dataclass
 class Investigation:
-question: str
-route: str
-ledger: Ledger
-verdict: str          # yes | unanswerable | stalled | budget_exhausted
-passes: int
-retrievals: int
-trajectory: list[dict[str, Any]] = field(default_factory=list)
+    question: str
+    route: str
+    ledger: Ledger
+    verdict: str          # yes | unanswerable | stalled | budget_exhausted
+    passes: int
+    retrievals: int
+    trajectory: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +315,8 @@ trajectory: list[dict[str, Any]] = field(default_factory=list)
 # ---------------------------------------------------------------------------
 
 def _extract_json(text: str) -> dict[str, Any] | None:
-"""First parseable JSON object anywhere in the text (fence-tolerant)."""
-decoder = json.JSONDecoder()
+    """First parseable JSON object anywhere in the text (fence-tolerant)."""
+    decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
         if ch == "{":
             try:
@@ -468,20 +464,8 @@ async def investigate(
 
 
 # ---------------------------------------------------------------------------
-# Triage and synthesis
+# Synthesis
 # ---------------------------------------------------------------------------
-
-async def triage(question: str) -> str: ###changed###
-    """Route a question: 'lookup' or 'investigation'. Defaults to investigation."""
-    try:
-        raw = await ask_gemini(TRIAGE_PROMPT, question, model=MODEL, web_search=False)
-    except Exception:
-        log.exception("triage call failed; defaulting to investigation")
-        return "investigation"
-    parsed = _extract_json(raw) or {}
-    route = parsed.get("route")
-    return route if route in ("lookup", "investigation") else "investigation"
-
 
 async def synthesize(inv: Investigation) -> str:
     """Write the final answer from the ledger alone (specs.md: synth is confined)."""
@@ -497,8 +481,8 @@ async def synthesize(inv: Investigation) -> str:
 
 
 async def answer(question: str) -> str:
-    """Full pipeline: triage -> investigate -> synthesize. The bot.py seam."""
-    inv = await investigate(question, route=route)
+    """Full pipeline: investigate -> synthesize. The bot.py seam."""
+    inv = await investigate(question)
     log.info("investigation done: route=%s verdict=%s passes=%d retrievals=%d",
-             route, inv.verdict, inv.passes, inv.retrievals)
+             inv.route, inv.verdict, inv.passes, inv.retrievals)
     return await synthesize(inv)
