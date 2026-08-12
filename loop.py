@@ -350,6 +350,12 @@ def _pass_context(
     return "\n\n".join(parts)
 
 
+def _log_block(title: str, body: str) -> None:
+    """Log a multi-line body under one heading, indented so it stays readable
+    as one unit in a stream of interleaved log lines."""
+    log.info("%s\n%s", title, "\n".join(f"    {line}" for line in body.splitlines()))
+
+
 def _response_parts(response: Any) -> tuple[str, list[Any]]:
     """Split a Gemini response into its text and its function calls."""
     text_chunks: list[str] = []
@@ -380,6 +386,9 @@ async def investigate(
     passes = 0
     retrievals = 0
 
+    log.info("investigating %r (route=%s, budget: %d passes / %d searches)",
+             question, route, max_passes, max_retrievals)
+
     while passes < max_passes:
         passes += 1
         context = _pass_context(
@@ -401,6 +410,10 @@ async def investigate(
         parsed = _extract_json(text) or {}
         verdict = parsed.get("sufficient")
         if verdict not in ("yes", "no", "unanswerable"):
+            # Keep the raw reply: a malformed verdict is the hardest failure to
+            # diagnose from counts alone.
+            log.warning("pass %d: no parseable verdict JSON; raw reply: %.800s",
+                        passes, text)
             notes.append(
                 "your previous reply had no parseable verdict JSON — respond with "
                 "the required JSON object"
@@ -426,9 +439,21 @@ async def investigate(
             "open_questions": len(ledger.open_questions),
             "harness_notes": list(notes),
         })
-        log.info("pass %d/%d verdict=%s calls=%s facts=%d",
-                 passes, max_passes, verdict,
-                 [s[0] for s in specs], len(ledger.facts))
+        log.info(
+            "pass %d/%d verdict=%s searches=%d/%d facts=%d inferences=%d "
+            "open_questions=%d dead_branches=%d",
+            passes, max_passes, verdict, retrievals, max_retrievals,
+            len(ledger.facts), len(ledger.inferences),
+            len(ledger.open_questions), len(ledger.dead_branches),
+        )
+        if parsed.get("notes"):
+            log.info("  planner notes: %s", parsed["notes"])
+        for name, args in specs:
+            log.info("  requested: %s(%s)", name, json.dumps(args, default=str))
+        if notes:
+            _log_block("  harness notes:", "\n".join(f"- {n}" for n in notes))
+        # The ledger is the whole working state — log it in full, not just counts.
+        _log_block(f"  ledger after pass {passes}:", ledger.render())
 
         if verdict != "no":
             break
@@ -443,6 +468,13 @@ async def investigate(
             return_exceptions=True,
         )
         retrievals += len(specs)
+        for (name, args), res in zip(specs, results):
+            if isinstance(res, BaseException):
+                log.warning("  %s(%s) failed: %s: %s",
+                            name, json.dumps(args, default=str),
+                            type(res).__name__, res)
+            else:
+                log.info("  %s -> %d rows", name, len(res))
         # Raw rows enter the next pass's context, then are evicted (decision 4).
         results_text = _render_results(
             [(name, args, res) for (name, args), res in zip(specs, results)]
@@ -451,6 +483,10 @@ async def investigate(
         # Pass budget ran out with the model still wanting more.
         if verdict == "no":
             verdict = "budget_exhausted"
+
+    log.info("investigation finished: verdict=%s after %d passes, %d searches",
+             verdict, passes, retrievals)
+    _log_block("final ledger:", ledger.render())
 
     return Investigation(
         question=question,
@@ -483,6 +519,6 @@ async def synthesize(inv: Investigation) -> str:
 async def answer(question: str) -> str:
     """Full pipeline: investigate -> synthesize. The bot.py seam."""
     inv = await investigate(question)
-    log.info("investigation done: route=%s verdict=%s passes=%d retrievals=%d",
-             inv.route, inv.verdict, inv.passes, inv.retrievals)
-    return await synthesize(inv)
+    answer_text = await synthesize(inv)
+    log.info("answer (%d chars): %s", len(answer_text), answer_text)
+    return answer_text
