@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 import discord
 from discord import app_commands
@@ -49,6 +50,14 @@ _nick_tasks: dict[int, asyncio.Task] = {}
 # stack up overlapping runs. Holding the task also keeps it from being garbage
 # collected mid-walk.
 _startup_task: asyncio.Task | None = None
+
+# Command syncing is per-process, not per-connection. tree.sync() is one of the
+# most aggressively rate-limited calls Discord offers, and on_ready fires again
+# on every reconnect — so syncing there turns a flaky connection into a stream
+# of syncs, and eventually a 429 the login itself inherits. The command set
+# cannot change while the process is alive, so once is all it can ever need; a
+# deploy that changes the commands is a new process and syncs again.
+_synced = False
 
 # Feature switches, toggled by the admin commands below. This dict is only a
 # cache: `settings` in Postgres is the durable copy. Railway rebuilds the
@@ -547,12 +556,23 @@ async def on_ready():
     # with a switch state that only exists in this process.
     await _load_switches()
 
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
-    else:
-        await tree.sync()
+    global _synced
+    if not _synced:
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                tree.copy_global_to(guild=guild)
+                await tree.sync(guild=guild)
+            else:
+                await tree.sync()
+            _synced = True
+        except discord.HTTPException as e:
+            # A failed sync must not take the process down. The commands
+            # already registered from the last deploy keep working, and the
+            # next start syncs again — whereas an exception here kills a bot
+            # that is otherwise connected and able to do its job.
+            print(f"[sync] failed ({e.status}): {e}", flush=True)
+
     print(f"Logged in as {client.user}")
 
     # Last, and in the background: catching up can take minutes on a long
@@ -605,5 +625,51 @@ async def on_message(message):
     # replies are sent by /respond and /ask, on the admin's explicit request.
 
 
+# How long the process is willing to sit out a rate limit before handing the
+# restart back to Railway. Long enough for an ordinary window to pass, short
+# enough that a container is never parked for an hour doing nothing.
+MAX_RATE_LIMIT_WAIT = 900
+
+
+def _retry_after(e: discord.HTTPException) -> float:
+    """Seconds Discord asked us to wait, or a conservative guess.
+
+    A Cloudflare ban answers with an HTML body rather than the usual JSON, so
+    the header is the only reliable place to read this from.
+    """
+    try:
+        return float(e.response.headers.get("Retry-After", 0)) or 60.0
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def main() -> None:
+    """Start the bot, and never answer a rate limit with an instant restart.
+
+    Railway restarts the container the moment the process exits non-zero. When
+    what killed it is a 429 on login, restarting is the one response guaranteed
+    to make it worse: every attempt is another request against the limit that is
+    already exhausted, and Discord extends the block each time. Waiting the
+    window out inside the container costs nothing and lets the restart land on
+    the other side of it.
+    """
+    try:
+        client.run(os.environ["DISCORD_TOKEN"])
+    except discord.HTTPException as e:
+        if e.status != 429:
+            raise
+        wait = min(_retry_after(e), MAX_RATE_LIMIT_WAIT)
+        print(
+            f"[startup] rate limited by Discord on login; waiting {wait:.0f}s "
+            f"before letting the process exit so the restart is not another "
+            f"request against the same limit",
+            flush=True,
+        )
+        time.sleep(wait)
+        # Non-zero on purpose: Railway's restart policy is what brings the bot
+        # back, and a clean exit would leave it down for good.
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
-    client.run(os.environ["DISCORD_TOKEN"])
+    main()
