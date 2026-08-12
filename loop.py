@@ -407,13 +407,24 @@ async def investigate(
         )
         text, calls = _response_parts(response)
 
+        # Every planner reply, verbatim and before any parsing — a pass is only
+        # reconstructable if what the model actually said is on the record,
+        # parsed or not. Function calls arrive as structured parts, not text,
+        # so a reply that is pure tool calls logs as empty here; they are
+        # logged below under "requested".
+        _log_block(f"  pass {passes} raw reply:",
+                   text or "(no text — function calls only)")
+
         parsed = _extract_json(text) or {}
+        if parsed:
+            _log_block(f"  pass {passes} parsed JSON:",
+                       json.dumps(parsed, ensure_ascii=False, indent=2, default=str))
+        else:
+            log.warning("  pass %d: no JSON object found in the reply", passes)
+
         verdict = parsed.get("sufficient")
         if verdict not in ("yes", "no", "unanswerable"):
-            # Keep the raw reply: a malformed verdict is the hardest failure to
-            # diagnose from counts alone.
-            log.warning("pass %d: no parseable verdict JSON; raw reply: %.800s",
-                        passes, text)
+            log.warning("  pass %d: no usable verdict (sufficient=%r)", passes, verdict)
             notes.append(
                 "your previous reply had no parseable verdict JSON — respond with "
                 "the required JSON object"
