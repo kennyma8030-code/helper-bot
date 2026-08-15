@@ -26,6 +26,15 @@ TEST_CHANNEL_ID = (
     int(os.environ["TEST_CHANNEL_ID"]) if os.environ.get("TEST_CHANNEL_ID") else None
 )
 
+# Ceiling on estimated Gemini spend, in USD. Once the recorded total crosses
+# it the scheduled conversation stops for good — it is the only thing here that
+# spends money without anyone asking it to, so it is the thing with a budget.
+#
+# Estimated, not billed: Google has no spend endpoint, so this is tokens the
+# API reported multiplied by the published price (llm.MODEL_PRICES). Treat it
+# as close, not exact, and leave headroom under a real billing limit.
+GEMINI_BUDGET_USD = float(os.environ.get("GEMINI_BUDGET_USD", "3"))
+
 # The only subjects the bots talk about. One is drawn per session, handed to
 # bot 1 as its opening subject, and then held for the whole conversation — the
 # other four are told to steer back to it rather than follow a tangent
@@ -297,6 +306,23 @@ def build_content(index):
     )
 
 
+async def _estimated_spend():
+    """Estimated Gemini spend so far in USD, or None if it can't be read.
+
+    None and 0.0 are different answers and the caller has to tell them apart:
+    0.0 means nothing has been spent, None means the budget is unknowable right
+    now — no database, or no DATABASE_URL on this service at all.
+    """
+    try:
+        await db.open_pool()
+        await db.init_db()
+        return await db.total_cost_usd()
+    except Exception as e:
+        print(f"[session] could not read api spend ({type(e).__name__}: {e})",
+              flush=True)
+        return None
+
+
 async def _post_opener(channel):
     """Bot 1 opens a conversation on a random topic. True if the message landed.
 
@@ -348,6 +374,24 @@ async def scheduled_session():
     if TEST_CHANNEL_ID is None:
         print("[session] TEST_CHANNEL_ID is not set; nothing to do", flush=True)
         return
+
+    spent = await _estimated_spend()
+    if spent is None:
+        # No reading means no way to know whether the budget is gone. Skipping
+        # one run costs 4 hours; running blind is how a cap gets passed. The
+        # next run tries again, so a brief database outage is not permanent.
+        print("[session] skipping: the spend so far could not be read", flush=True)
+        return
+    if spent >= GEMINI_BUDGET_USD:
+        print(f"[session] estimated spend ${spent:.2f} has reached the "
+              f"${GEMINI_BUDGET_USD:.2f} budget; switching the schedule off. "
+              f"Raise GEMINI_BUDGET_USD and redeploy to turn it back on.",
+              flush=True)
+        scheduled_session.stop()
+        return
+    print(f"[session] estimated spend so far: ${spent:.4f} "
+          f"of ${GEMINI_BUDGET_USD:.2f}", flush=True)
+
     if test_enabled:
         # A manual /test run, or an overrunning previous session. Either way,
         # starting now would clear state out from under a live conversation.

@@ -195,6 +195,25 @@ CREATE TABLE IF NOT EXISTS settings (
     value               boolean     NOT NULL,
     updated_at          timestamptz NOT NULL DEFAULT now()
 );
+
+-- Estimated Gemini spend, one row per model call. In the database rather than
+-- in memory for two reasons: the containers are rebuilt on every deploy and
+-- crash, and the RAG bot and the test bots are separate containers sharing one
+-- API key — a per-process counter would see half the spend and reset to zero
+-- on restart.
+--
+-- Estimated, not billed. Google exposes no spend endpoint; this is tokens
+-- reported by the API multiplied by the published price. See llm.MODEL_PRICES.
+CREATE TABLE IF NOT EXISTS api_usage (
+    id                  bigserial   PRIMARY KEY,
+    model               text        NOT NULL,
+    input_tokens        bigint      NOT NULL,
+    output_tokens       bigint      NOT NULL,
+    cost_usd            numeric(14,8) NOT NULL,
+    called_at           timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS api_usage_called_at_idx ON api_usage (called_at);
 """
 
 
@@ -331,6 +350,49 @@ async def clear_channel(channel_id: int) -> dict[str, int]:
         "summaries": summaries,
         "watermarks": watermarks,
     }
+
+
+# ---------------------------------------------------------------------------
+# API spend
+# ---------------------------------------------------------------------------
+
+async def record_usage(
+    *,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: float,
+) -> None:
+    """Append one model call's estimated cost."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO api_usage (model, input_tokens, output_tokens, cost_usd) "
+            "VALUES (%s, %s, %s, %s)",
+            (model, input_tokens, output_tokens, cost_usd),
+        )
+
+
+async def total_cost_usd(since: Optional[datetime] = None) -> float:
+    """Estimated spend across every recorded call, in USD.
+
+    `since` limits it to calls after a moment — for a monthly cap rather than
+    a lifetime one. Default is everything the table holds.
+    """
+    pool = _get_pool()
+    sql = "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM api_usage"
+    params: list[Any] = []
+    if since is not None:
+        sql += " WHERE called_at >= %s"
+        params.append(_as_utc(since))
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            row = await cur.fetchone()
+
+    # numeric comes back as Decimal; callers compare against a plain float.
+    return float(row["total"]) if row else 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from typing import Any
 from google.genai import types
 
 import db
-from llm import ask_gemini, client
+from llm import ask_gemini, client, track_usage
 from prompts import PLANNER_PROMPT, SYNTH_PROMPT
 
 log = logging.getLogger(__name__)
@@ -394,7 +394,7 @@ async def _planner_pass(context: str, passes: int) -> Any:
     """One planner call, with the cache and without it as a fallback."""
     cache_name = await _planner_cache()
     try:
-        return await client.aio.models.generate_content(
+        response = await client.aio.models.generate_content(
             model=MODEL,
             contents=context,
             config=_planner_config(cache_name),
@@ -408,11 +408,17 @@ async def _planner_pass(context: str, passes: int) -> Any:
         log.warning("pass %d failed with the planner cache (%s: %s); retrying "
                     "without it", passes, type(e).__name__, e)
         _forget_cache(cache_name)
-        return await client.aio.models.generate_content(
+        response = await client.aio.models.generate_content(
             model=MODEL,
             contents=context,
             config=_planner_config(None),
         )
+
+    # These calls go straight to the client rather than through ask_gemini, so
+    # they have to be counted here or the planner — the most expensive thing
+    # either bot does — would not show up in the spend at all.
+    await track_usage(MODEL, response)
+    return response
 
 
 # ---------------------------------------------------------------------------
