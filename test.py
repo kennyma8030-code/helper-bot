@@ -26,35 +26,20 @@ TEST_CHANNEL_ID = (
     int(os.environ["TEST_CHANNEL_ID"]) if os.environ.get("TEST_CHANNEL_ID") else None
 )
 
-# One of these is drawn per session and handed to bot 1 as its opening subject.
+# The only subjects the bots talk about. One is drawn per session, handed to
+# bot 1 as its opening subject, and then held for the whole conversation — the
+# other four are told to steer back to it rather than follow a tangent
+# somewhere else.
+#
 # Picking in code rather than asking the model for "something random" is what
 # keeps sessions from all sounding alike — models reach for the same handful of
 # ideas when left to invent a topic. Edit this list freely.
 TOPICS = [
-    "the correct way to eat a burrito",
-    "whether cereal counts as soup",
-    "the worst haircut you've ever had",
-    "airport food, ranked",
-    "people who reply 'k'",
-    "the best sound in the world",
-    "whether hot dogs are sandwiches",
-    "an unreasonably strong opinion about socks",
-    "the last thing that made you laugh out loud",
-    "elevator etiquette",
-    "songs that are objectively too long",
-    "the ideal number of pillows",
-    "what you'd name a boat",
-    "grocery store self-checkout",
-    "the most overrated snack",
-    "whether you'd survive in the wilderness",
-    "an animal that could take you in a fight",
-    "the tyranny of group photos",
-    "food you loved as a kid and can't stand now",
-    "people who stand up the second the plane lands",
-    "the best excuse for leaving a party early",
-    "whether a straw has one hole or two",
-    "your position on pineapple, generally",
-    "the most useless thing you own",
+    "hiking",
+    "piano",
+    "soccer",
+    "aquascaping",
+    "classical music",
 ]
 
 # Bots are identified by number only: 1_bot, 2_bot, ...
@@ -88,26 +73,59 @@ prev_res = {}
 test_enabled = False
 sleep_seconds = 3.0
 
+# The subject drawn for the conversation that is running now. Set when the
+# opener is posted and read by every bot's handler for the rest of the session,
+# which is what keeps all five on one subject instead of five.
+current_topic = ""
+
 # Slash command lives on bot 1's client; it controls the whole test.
 tree = app_commands.CommandTree(args[0])
 
 
-@tree.command(name="test", description="Turn the bot conversation test on or off (admin only).")
-@app_commands.describe(on="True to start (resets the conversation), False to stop")
+@tree.command(name="test", description="Start or stop the bot conversation (admin only).")
+@app_commands.describe(on="True to start a conversation here, False to stop")
 async def test(interaction: discord.Interaction, on: bool):
     global test_enabled, message_number, prev_res
     if interaction.user.id != ADMIN_USER_ID:
         await interaction.response.send_message("NOT ALOUD!", ephemeral=True)
         return
-    test_enabled = on
-    if on:
-        # Fresh run: back to kickoff state.
-        message_number = 0
-        past_messages.clear()
-        prev_res = {}
-        bot_context.clear()
-    await interaction.response.send_message(
-        f"test is now {'on' if on else 'off'}.", ephemeral=True
+
+    if not on:
+        test_enabled = False
+        await interaction.response.send_message("test is now off.", ephemeral=True)
+        return
+
+    channel = interaction.channel
+    if not isinstance(channel, discord.abc.Messageable):
+        await interaction.response.send_message(
+            "Nothing can be posted here; run it from a text channel.", ephemeral=True
+        )
+        return
+
+    # Writing the opener is a model call, which takes longer than the 3 seconds
+    # Discord allows a command to stay silent.
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Fresh run: every conversation starts from nothing.
+    message_number = 0
+    past_messages.clear()
+    prev_res = {}
+    bot_context.clear()
+    test_enabled = True
+
+    # Bot 1 opens on its own rather than waiting to be spoken to. The same call
+    # the scheduled session makes, so a hand-started conversation and a timed
+    # one are the same thing from the other four bots' side.
+    if not await _post_opener(channel):
+        test_enabled = False
+        await interaction.edit_original_response(
+            content="Couldn't write an opener — the model's reply didn't parse. "
+                    "Nothing started; check the logs and try again."
+        )
+        return
+
+    await interaction.edit_original_response(
+        content=f"test is now on. Talking about: {current_topic}"
     )
 
 
@@ -286,14 +304,18 @@ async def _post_opener(channel):
     contract, same routing, so bots 2..N carry on with the existing handler and
     never learn the conversation started itself.
     """
-    topic = random.choice(TOPICS)
-    print(f"[session] topic: {topic}", flush=True)
+    global current_topic
+
+    # Set before the call, not after: the four other bots read it to stay on
+    # subject, and the gateway can hand them the opener the instant it lands.
+    current_topic = random.choice(TOPICS)
+    print(f"[session] topic: {current_topic}", flush=True)
 
     prompt = fill_prompt(
         OPENER_PROMPT,
         bot_name="1_bot", bot_number=1,
         num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
-        topic=topic,
+        topic=current_topic,
     )
     raw = await ask_gemini(prompt, "The chat is empty. Say the first thing.",
                            web_search=False)
@@ -414,6 +436,7 @@ def handler_helper(client, index):
                 CONVO_PROMPT,
                 bot_name=f"{index}_bot", bot_number=index,
                 num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
+                topic=current_topic,
             )
 
         await asyncio.sleep(sleep_seconds)
