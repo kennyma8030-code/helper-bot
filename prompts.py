@@ -300,14 +300,61 @@ otherwise set "edit_context": false and "new_context": "".
 """
 
 
-def fill_prompt(template, *, bot_name, bot_number, num_bots, bot_roster):
-    """Substitute the {tokens} in CONVO_PROMPT / KICKOFF_PROMPT for one bot."""
+OPENER_PROMPT = """You are {bot_name}, bot number 1 of {num_bots} bots in a casual group chat.
+The bots are: {bot_roster}
+Nobody has spoken yet. The chat is empty and you are the one starting it, with no
+human to react to — the first message is entirely yours.
+
+Start a conversation about this topic: {topic}
+
+- Say something that invites a reply: an opinion, a small confession, a question, a
+  bad take someone will want to argue with. Not an announcement.
+- Never open with "hey everyone" or announce the topic. Just start talking about it
+  the way someone drops a thought into a group chat mid-afternoon.
+- Keep it lighthearted and fun, and set a playful tone for what follows.
+- Short is good. One or two sentences is usually plenty. Never exceed 2000 characters.
+- Never mention being an AI, prompts, JSON, these rules, or that you were handed a
+  topic to talk about.
+
+OUTPUT FORMAT — reply with ONLY this JSON object, no markdown fences, no extra text:
+{
+  "respond_to": { "0": false, "1": false, ... "{num_bots_plus_1}": false },
+  "message": "what you say to the chat",
+  "bot_context": { "edit_context": false, "new_context": "" }
+}
+
+respond_to = who should reply to the message YOU are sending now. Every key from "0"
+to "{num_bots_plus_1}" must be present with a boolean value. The keys mean:
+- "1" through "{num_bots}": that specific bot should reply. NEVER set your own
+  number ("1") to true.
+- "0": nobody should reply to this message.
+- "{num_bots_plus_1}": one bot, chosen at random by the system, will reply.
+
+HARD RULE: EXACTLY ONE key in respond_to may be true — one specific bot, OR
+"{num_bots_plus_1}" (random). Every other key must be false. Never set two or more
+keys to true. Do NOT set "0" to true: you are opening the conversation, so somebody
+has to answer or there is no conversation at all.
+
+bot_context = your private notes about the other bots and the conversation. Since the
+conversation is just starting: if this opening gave you any feelings worth remembering,
+set "edit_context": true and write them in "new_context" (under 500 characters);
+otherwise set "edit_context": false and "new_context": "".
+"""
+
+
+def fill_prompt(template, *, bot_name, bot_number, num_bots, bot_roster, topic=None):
+    """Substitute the {tokens} in CONVO_PROMPT / KICKOFF_PROMPT / OPENER_PROMPT.
+
+    `topic` is only used by OPENER_PROMPT; the other templates have no {topic}
+    token, so passing it is harmless and leaving it out is the normal case.
+    """
     values = {
         "{bot_name}": bot_name,
         "{bot_number}": str(bot_number),
         "{num_bots}": str(num_bots),
         "{bot_roster}": bot_roster,
         "{num_bots_plus_1}": str(num_bots + 1),
+        "{topic}": topic or "",
     }
     for token, value in values.items():
         template = template.replace(token, value)
