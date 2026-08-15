@@ -285,6 +285,54 @@ async def init_db() -> None:
     log.info("db schema ensured")
 
 
+async def clear_channel(channel_id: int) -> dict[str, int]:
+    """Delete everything stored for one channel. Returns the rows removed.
+
+    Scoped to a single channel on purpose: this backs a per-channel reset, and
+    the other channels in the corpus have nothing to do with it.
+
+    `settings` is deliberately untouched. It holds the durable power/RAG
+    switches, which are not channel-scoped — wiping them would silently turn
+    the bot off, and the caller asking to empty a channel has not asked for
+    that. The schema itself is left in place; this empties rows, it does not
+    drop tables.
+
+    All three deletes share one transaction, so a reset either lands whole or
+    not at all — no run can leave summaries pointing at messages that are gone.
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # Summaries first. Session rows reference day rows in this same
+            # table via parent_id, and deleting the whole channel's worth in
+            # one statement avoids depending on which tier goes first.
+            await cur.execute(
+                "DELETE FROM day_summaries WHERE channel_id = %s", (channel_id,)
+            )
+            summaries = cur.rowcount
+            await cur.execute(
+                "DELETE FROM messages WHERE channel_id = %s", (channel_id,)
+            )
+            messages = cur.rowcount
+            # The watermark has to go too, or the summarizer believes the
+            # channel is caught up through a date whose messages no longer
+            # exist and never re-reads it.
+            await cur.execute(
+                "DELETE FROM summary_state WHERE channel_id = %s", (channel_id,)
+            )
+            watermarks = cur.rowcount
+
+    log.info(
+        "cleared channel %d: %d messages, %d summaries, %d watermarks",
+        channel_id, messages, summaries, watermarks,
+    )
+    return {
+        "messages": messages,
+        "summaries": summaries,
+        "watermarks": watermarks,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Ingestion
 # ---------------------------------------------------------------------------

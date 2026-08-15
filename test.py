@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import db
 from llm import ask_gemini
 from prompts import CONVO_PROMPT, KICKOFF_PROMPT, OPENER_PROMPT, fill_prompt
 import random
@@ -123,6 +124,111 @@ async def sleep(interaction: discord.Interaction, seconds: float):
     sleep_seconds = seconds
     await interaction.response.send_message(
         f"reply delay is now {seconds:g}s.", ephemeral=True
+    )
+
+
+@tree.command(
+    name="reset",
+    description="Delete every message in this channel and its stored history (admin only).",
+)
+@app_commands.describe(
+    confirm="Must be True. Every message in this channel is deleted and cannot be recovered."
+)
+async def reset(interaction: discord.Interaction, confirm: bool):
+    """Empty one channel in both places it exists: Postgres and Discord."""
+    global test_enabled, message_number, prev_res
+
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message("NOT ALOUD!", ephemeral=True)
+        return
+    if not confirm:
+        await interaction.response.send_message(
+            "Nothing done. Run it again with confirm:True to actually wipe the channel.",
+            ephemeral=True,
+        )
+        return
+
+    # Forums and categories are channels you cannot post in, and they have no
+    # message history to walk. Nothing should route a command here, but the
+    # type allows it and the walk below would fail with an AttributeError.
+    channel = interaction.channel
+    if not isinstance(channel, discord.abc.Messageable):
+        await interaction.response.send_message(
+            "This channel has no messages to delete; run it from a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    # Walking a channel takes minutes and Discord drops a command that has not
+    # replied within 3 seconds. defer() buys 15; a long wipe outlives even that,
+    # which is why every step also prints to the log.
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Stop the conversation before deleting anything. Bots that are still
+    # talking would post new messages into a channel being emptied, and the
+    # walk would never catch up with them.
+    test_enabled = False
+    message_number = 0
+    past_messages.clear()
+    prev_res = {}
+    bot_context.clear()
+
+    async def progress(text: str) -> None:
+        # A failed edit (rate limit, or a token that expired mid-wipe) must not
+        # abort a reset that is otherwise working.
+        try:
+            await interaction.edit_original_response(content=text)
+        except discord.HTTPException:
+            pass
+
+    # The database first: it is one fast transaction that either lands or does
+    # not, so its result is known before the slow part starts. A reset that is
+    # interrupted later is safe to run again — both halves are idempotent.
+    print(f"[/reset] wiping channel {channel.id}", flush=True)
+    try:
+        await db.open_pool()
+        await db.init_db()
+        rows = await db.clear_channel(channel.id)
+        db_line = (
+            f"Database: {rows['messages']} messages, {rows['summaries']} summaries."
+        )
+    except Exception as e:
+        # No database is a normal state for this service — it does not need one
+        # for anything else. Say so and still clear the channel.
+        print(f"[/reset] db wipe failed ({type(e).__name__}: {e})", flush=True)
+        db_line = f"Database: skipped ({type(e).__name__} — check DATABASE_URL)."
+
+    await progress(f"{db_line}\nNow deleting messages…")
+
+    # One at a time, newest first. Discord's bulk delete refuses anything over
+    # 14 days old, which in a channel this bot has been sitting in is most of
+    # it; deleting individually is slower but has no such cutoff. discord.py
+    # waits out the rate limits on its own, so a big channel just takes a while.
+    deleted = 0
+    try:
+        async for message in channel.history(limit=None, oldest_first=False):
+            try:
+                await message.delete()
+            except discord.NotFound:
+                # Already gone — someone else deleted it, or a previous run did.
+                continue
+            deleted += 1
+            if deleted % 25 == 0:
+                await progress(f"{db_line}\nDeleted {deleted} messages so far…")
+            if deleted % 100 == 0:
+                print(f"[/reset] deleted {deleted} messages", flush=True)
+    except discord.Forbidden:
+        print(f"[/reset] forbidden after {deleted} messages", flush=True)
+        await progress(
+            f"{db_line}\nDeleted {deleted} messages, then stopped: 1_bot needs the "
+            f"Manage Messages and Read Message History permissions in this channel."
+        )
+        return
+
+    print(f"[/reset] done: {deleted} messages deleted", flush=True)
+    await progress(
+        f"{db_line}\nChannel: {deleted} messages deleted. The conversation is reset "
+        f"and the bots are off."
     )
 
 
