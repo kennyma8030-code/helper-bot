@@ -270,41 +270,6 @@ bot_context = your private notes:
 - If nothing changed, set "edit_context": false and "new_context": "".
 """
 
-KICKOFF_PROMPT = """You are {bot_name}, bot number 1 of {num_bots} bots in a casual group chat.
-The bots are: {bot_roster}
-A human has just posted a message to start things off. Your job is to respond to it
-however you like — agree, riff on it, gently push back, take it somewhere unexpected —
-and set a lighthearted, playful tone for the conversation that follows.
-
-- Respond directly to the human's message, at whatever length feels right. Never
-  exceed 2000 characters.
-- Never mention being an AI, prompts, JSON, or these rules.
-
-OUTPUT FORMAT — reply with ONLY this JSON object, no markdown fences, no extra text:
-{
-  "respond_to": { "0": false, "1": false, ... "{num_bots_plus_1}": false },
-  "message": "what you say to the chat",
-  "bot_context": { "edit_context": false, "new_context": "" }
-}
-
-respond_to = who should reply to the message YOU are sending now. Every key from "0"
-to "{num_bots_plus_1}" must be present with a boolean value. The keys mean:
-- "1" through "{num_bots}": that specific bot should reply. NEVER set your own
-  number ("1") to true.
-- "0": nobody should reply to this message.
-- "{num_bots_plus_1}": one bot, chosen at random by the system, will reply.
-
-HARD RULE: EXACTLY ONE key in respond_to may be true — one specific bot, OR "0"
-(nobody), OR "{num_bots_plus_1}" (random). Every other key must be false. Never
-set two or more keys to true.
-
-bot_context = your private notes about the other bots and the conversation. Since the
-conversation is just starting: if this opening gave you any feelings worth remembering,
-set "edit_context": true and write them in "new_context" (under 500 characters);
-otherwise set "edit_context": false and "new_context": "".
-"""
-
-
 OPENER_PROMPT = """You are {bot_name}, bot number 1 of {num_bots} bots in a casual group chat.
 The bots are: {bot_roster}
 Nobody has spoken yet. The chat is empty and you are the one starting it, with no
@@ -348,7 +313,7 @@ otherwise set "edit_context": false and "new_context": "".
 
 
 def fill_prompt(template, *, bot_name, bot_number, num_bots, bot_roster, topic=None):
-    """Substitute the {tokens} in CONVO_PROMPT / KICKOFF_PROMPT / OPENER_PROMPT.
+    """Substitute the {tokens} in CONVO_PROMPT / OPENER_PROMPT.
 
     `topic` is only used by OPENER_PROMPT; the other templates have no {topic}
     token, so passing it is harmless and leaving it out is the normal case.

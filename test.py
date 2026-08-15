@@ -7,7 +7,7 @@ import json
 import os
 import db
 from llm import ask_gemini
-from prompts import CONVO_PROMPT, KICKOFF_PROMPT, OPENER_PROMPT, fill_prompt
+from prompts import CONVO_PROMPT, OPENER_PROMPT, fill_prompt
 import random
 from collections import defaultdict
 import time
@@ -400,44 +400,31 @@ def handler_helper(client, index):
         print(f"[bot {index}] saw msg {message.id} from {message.author.id} "
               f"(message_number={message_number}): {message.content[:80]!r}", flush=True)
 
-        if message_number == 0:
-            # Kickoff: the human's opening message; bot 1 answers, others wait.
-            if message.author.id != ADMIN_USER_ID or index != 1:
-                print(f"[bot {index}] kickoff: not admin+bot1, ignoring", flush=True)
+        # Ignore my own messages.
+        if message.author.id == bot_id_map[index]:
+            print(f"[bot {index}] own message, ignoring", flush=True)
+            return
+        routing = prev_res.get("respond_to") or {}
+        if routing.get("0"):
+            print(f"[bot {index}] routing says nobody replies, ignoring", flush=True)
+            return
+        if routing.get(str(NUMBER_OF_BOTS + 1)):
+            pick = random_pick(message)
+            if pick != index:
+                print(f"[bot {index}] random mode picked {pick}, not me, ignoring", flush=True)
                 return
-            print(f"[bot {index}] kickoff: responding to human", flush=True)
-            past_messages.append(f"human: {message.content}")
-            prompt = fill_prompt(
-                KICKOFF_PROMPT,
-                bot_name="1_bot", bot_number=1,
-                num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
-            )
+            print(f"[bot {index}] random mode picked me", flush=True)
+        elif not routing.get(str(index)):
+            print(f"[bot {index}] not routed to me (routing={routing}), ignoring", flush=True)
+            return
         else:
-            # Ignore my own messages.
-            if message.author.id == bot_id_map[index]:
-                print(f"[bot {index}] own message, ignoring", flush=True)
-                return
-            routing = prev_res.get("respond_to") or {}
-            if routing.get("0"):
-                print(f"[bot {index}] routing says nobody replies, ignoring", flush=True)
-                return
-            if routing.get(str(NUMBER_OF_BOTS + 1)):
-                pick = random_pick(message)
-                if pick != index:
-                    print(f"[bot {index}] random mode picked {pick}, not me, ignoring", flush=True)
-                    return
-                print(f"[bot {index}] random mode picked me", flush=True)
-            elif not routing.get(str(index)):
-                print(f"[bot {index}] not routed to me (routing={routing}), ignoring", flush=True)
-                return
-            else:
-                print(f"[bot {index}] routed to me, responding", flush=True)
-            prompt = fill_prompt(
-                CONVO_PROMPT,
-                bot_name=f"{index}_bot", bot_number=index,
-                num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
-                topic=current_topic,
-            )
+            print(f"[bot {index}] routed to me, responding", flush=True)
+        prompt = fill_prompt(
+            CONVO_PROMPT,
+            bot_name=f"{index}_bot", bot_number=index,
+            num_bots=NUMBER_OF_BOTS, bot_roster=BOT_ROSTER,
+            topic=current_topic,
+        )
 
         await asyncio.sleep(sleep_seconds)
         raw = await ask_gemini(prompt, build_content(index), web_search=False)
