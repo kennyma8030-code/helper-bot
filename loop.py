@@ -311,6 +311,111 @@ class Investigation:
 
 
 # ---------------------------------------------------------------------------
+# Planner cache — the part of every request that never changes
+# ---------------------------------------------------------------------------
+
+# PLANNER_PROMPT and the tool schemas are identical on every pass of every
+# investigation, and MAX_PASSES means one question can resend them 16 times.
+# Gemini will hold them server-side and charge less for the repeats, so the
+# cache is built once per process and reused by every investigation after.
+#
+# The ledger is deliberately not in here. It changes on every pass and dies
+# with the investigation, so caching it would cost more than it saves; it
+# stays inline in the per-pass context.
+CACHE_TTL_SECONDS = 3600
+
+_cache_name: str | None = None
+
+# Two investigations can start at once (/ask is not serialized), and both would
+# otherwise create their own cache. The second one waits and reuses the first.
+_cache_lock = asyncio.Lock()
+
+
+async def _planner_cache() -> str | None:
+    """The cached prompt+tools, created on first use. None if unavailable.
+
+    None is a normal outcome, not an error: a prompt under the model's minimum
+    cacheable size is refused, and the API can decline for its own reasons.
+    Callers fall back to sending the prompt inline, which costs more per pass
+    and behaves identically otherwise.
+    """
+    global _cache_name
+
+    if _cache_name is not None:
+        return _cache_name
+
+    async with _cache_lock:
+        # Someone else may have created it while this call waited for the lock.
+        if _cache_name is not None:
+            return _cache_name
+
+        try:
+            cache = await client.aio.caches.create(
+                model=MODEL,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=PLANNER_PROMPT,
+                    tools=[TOOLS],
+                    ttl=f"{CACHE_TTL_SECONDS}s",
+                    display_name="helper-bot planner",
+                ),
+            )
+        except Exception as e:
+            log.warning("planner cache unavailable (%s: %s); sending the prompt "
+                        "inline instead", type(e).__name__, e)
+            return None
+
+        _cache_name = cache.name
+        log.info("planner cache created: %s (ttl %ds)", _cache_name, CACHE_TTL_SECONDS)
+        return _cache_name
+
+
+def _forget_cache(name: str) -> None:
+    """Drop a cache that stopped working, unless it has already been replaced."""
+    global _cache_name
+    if _cache_name == name:
+        _cache_name = None
+
+
+def _planner_config(cache_name: str | None) -> types.GenerateContentConfig:
+    """Config for one planner pass.
+
+    With a cache the prompt and tools live inside it and must not be repeated
+    here — sending both is rejected.
+    """
+    if cache_name:
+        return types.GenerateContentConfig(cached_content=cache_name)
+    return types.GenerateContentConfig(
+        system_instruction=PLANNER_PROMPT,
+        tools=[TOOLS],
+    )
+
+
+async def _planner_pass(context: str, passes: int) -> Any:
+    """One planner call, with the cache and without it as a fallback."""
+    cache_name = await _planner_cache()
+    try:
+        return await client.aio.models.generate_content(
+            model=MODEL,
+            contents=context,
+            config=_planner_config(cache_name),
+        )
+    except Exception as e:
+        if cache_name is None:
+            raise
+        # The cache expires on its own schedule and can be deleted from under
+        # us mid-investigation. Retry this pass inline rather than losing the
+        # whole run; if that fails too, the error is real and propagates.
+        log.warning("pass %d failed with the planner cache (%s: %s); retrying "
+                    "without it", passes, type(e).__name__, e)
+        _forget_cache(cache_name)
+        return await client.aio.models.generate_content(
+            model=MODEL,
+            contents=context,
+            config=_planner_config(None),
+        )
+
+
+# ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
 
@@ -397,14 +502,7 @@ async def investigate(
         )
         notes = []
 
-        response = await client.aio.models.generate_content(
-            model=MODEL,
-            contents=context,
-            config=types.GenerateContentConfig(
-                system_instruction=PLANNER_PROMPT,
-                tools=[TOOLS],
-            ),
-        )
+        response = await _planner_pass(context, passes)
         text, calls = _response_parts(response)
 
         # Every planner reply, verbatim and before any parsing — a pass is only
