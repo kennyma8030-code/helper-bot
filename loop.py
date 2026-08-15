@@ -376,6 +376,15 @@ def _forget_cache(name: str) -> None:
         _cache_name = None
 
 
+# This loop dispatches tool calls itself (see _execute_call), so the SDK must
+# not try to call anything on its own. TOOLS is declarative — FunctionDeclaration
+# objects, not Python callables — so automatic function calling has nothing it
+# could invoke and never fires either way; the SDK still logs a recommendation
+# to use AsyncChat.send_message on every pass with tools attached. Saying no
+# outright silences that and makes the manual dispatch explicit.
+_NO_AUTO_CALLING = types.AutomaticFunctionCallingConfig(disable=True)
+
+
 def _planner_config(cache_name: str | None) -> types.GenerateContentConfig:
     """Config for one planner pass.
 
@@ -383,10 +392,14 @@ def _planner_config(cache_name: str | None) -> types.GenerateContentConfig:
     here — sending both is rejected.
     """
     if cache_name:
-        return types.GenerateContentConfig(cached_content=cache_name)
+        return types.GenerateContentConfig(
+            cached_content=cache_name,
+            automatic_function_calling=_NO_AUTO_CALLING,
+        )
     return types.GenerateContentConfig(
         system_instruction=PLANNER_PROMPT,
         tools=[TOOLS],
+        automatic_function_calling=_NO_AUTO_CALLING,
     )
 
 
