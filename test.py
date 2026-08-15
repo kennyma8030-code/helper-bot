@@ -87,6 +87,14 @@ sleep_seconds = 3.0
 # which is what keeps all five on one subject instead of five.
 current_topic = ""
 
+# Whether the 4-hour schedule should be running at all — /schedule writes it.
+# Kept in the settings table so it outlives the container: a switch that came
+# back on after every deploy would be a switch you cannot trust to stay off.
+# The key is prefixed because the RAG bot stores its own switches in that same
+# table under "bot" and "RAG".
+SCHEDULE_SWITCH_KEY = "test_schedule"
+schedule_enabled = True
+
 # Slash command lives on bot 1's client; it controls the whole test.
 tree = app_commands.CommandTree(args[0])
 
@@ -135,6 +143,77 @@ async def test(interaction: discord.Interaction, on: bool):
 
     await interaction.edit_original_response(
         content=f"test is now on. Talking about: {current_topic}"
+    )
+
+
+@tree.command(
+    name="schedule",
+    description="Turn the 4-hour scheduled conversation on or off (admin only).",
+)
+@app_commands.describe(on="True to run a conversation every 4 hours, False to stop")
+async def schedule(interaction: discord.Interaction, on: bool):
+    global schedule_enabled
+
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message("NOT ALOUD!", ephemeral=True)
+        return
+
+    # Saving the switch and reading the spend both go to the database.
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    schedule_enabled = on
+    notes = []
+    try:
+        await db.open_pool()
+        await db.init_db()
+        await db.set_switch(SCHEDULE_SWITCH_KEY, on)
+    except Exception as e:
+        print(f"[schedule] could not save the switch ({type(e).__name__}: {e})",
+              flush=True)
+        notes.append("Couldn't save it — a redeploy will forget this.")
+
+    if not on:
+        # cancel(), not stop(). stop() is only checked after an iteration
+        # finishes, so a loop sleeping between conversations would wait out the
+        # rest of its four hours and hold one more conversation before noticing
+        # it was switched off.
+        scheduled_session.cancel()
+        notes.append("A conversation running right now stops too.")
+        await interaction.edit_original_response(
+            content="\n".join(["The 4-hour schedule is **off**.", *notes])
+        )
+        return
+
+    if TEST_CHANNEL_ID is None:
+        notes.append("TEST_CHANNEL_ID isn't set, so runs will do nothing until it is.")
+
+    spent = await _estimated_spend()
+    if spent is None:
+        notes.append("The database can't be read, so every run will skip itself "
+                     "until it can — check DATABASE_URL.")
+    elif spent >= GEMINI_BUDGET_USD:
+        # Starting it here would only have it stop itself on the first run.
+        notes.append(f"Not started: estimated spend is ${spent:.2f} of the "
+                     f"${GEMINI_BUDGET_USD:.2f} budget. Raise GEMINI_BUDGET_USD "
+                     f"and redeploy.")
+        await interaction.edit_original_response(
+            content="\n".join(["The 4-hour schedule is **on**.", *notes])
+        )
+        return
+    else:
+        notes.append(f"Estimated spend so far: ${spent:.4f} of "
+                     f"${GEMINI_BUDGET_USD:.2f}.")
+
+    if scheduled_session.is_running():
+        notes.append("It was already running.")
+    else:
+        # The first iteration fires immediately, not in four hours.
+        scheduled_session.start()
+        notes.append("A conversation starts now, then every "
+                     f"{SESSION_EVERY_HOURS} hours.")
+
+    await interaction.edit_original_response(
+        content="\n".join(["The 4-hour schedule is **on**.", *notes])
     )
 
 
@@ -269,9 +348,14 @@ async def on_ready():
         await tree.sync()
     print(f"test controller logged in as {args[0].user}", flush=True)
 
-    # on_ready fires again on every reconnect; is_running() keeps a flaky
-    # connection from stacking up a second timer on top of the first.
-    if not scheduled_session.is_running():
+    # on_ready fires again on every reconnect, so this runs repeatedly. Reading
+    # the switch each time is what keeps a reconnect from restarting a schedule
+    # that /schedule turned off; is_running() keeps a flaky connection from
+    # stacking a second timer on top of the first.
+    await _load_schedule_switch()
+    if not schedule_enabled:
+        print("[schedule] not starting: switched off", flush=True)
+    elif not scheduled_session.is_running():
         scheduled_session.start()
 
 
@@ -304,6 +388,32 @@ def build_content(index):
         + "\n\nYOUR PRIVATE CONTEXT:\n"
         + (bot_context[index] or "(none yet)")
     )
+
+
+async def _load_schedule_switch():
+    """Read the stored on/off state of the schedule into schedule_enabled.
+
+    A database that cannot be reached leaves the current value alone. The
+    alternative — defaulting to on — would turn the schedule back on every time
+    the database blinked, which is the one direction this switch must never
+    fail in: it is what someone reaches for to stop the spending.
+    """
+    global schedule_enabled
+    try:
+        await db.open_pool()
+        await db.init_db()
+        stored = await db.get_switches()
+    except Exception as e:
+        print(f"[schedule] could not read the stored switch "
+              f"({type(e).__name__}: {e}); leaving it "
+              f"{'on' if schedule_enabled else 'off'}", flush=True)
+        return
+
+    # Absent means never set, which is not the same as False — the default of
+    # on has to survive a fresh database.
+    if SCHEDULE_SWITCH_KEY in stored:
+        schedule_enabled = stored[SCHEDULE_SWITCH_KEY]
+    print(f"[schedule] schedule is {'on' if schedule_enabled else 'off'}", flush=True)
 
 
 async def _estimated_spend():
@@ -412,15 +522,15 @@ async def scheduled_session():
     test_enabled = True
 
     print(f"[session] starting a {SESSION_MINUTES}-minute conversation", flush=True)
-    if not await _post_opener(channel):
-        test_enabled = False
-        return
-
     try:
+        if not await _post_opener(channel):
+            return
         await asyncio.sleep(SESSION_MINUTES * 60)
     finally:
-        # Off even if the wait is cancelled, so a reload can never leave the
-        # bots talking forever.
+        # Off however this ends: a failed opener, a model error, or /schedule
+        # off cancelling the loop mid-conversation. Any path that leaves this
+        # True leaves five bots answering every message in the server with no
+        # session running and nothing to switch them off.
         test_enabled = False
     print("[session] finished", flush=True)
 
