@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -74,6 +75,21 @@ switches = {"bot": True, "RAG": True}
 # Ceiling on the write-through, leaving headroom inside Discord's 3s reply
 # deadline. See _save_switch.
 SWITCH_SAVE_TIMEOUT = 2.0
+
+# How far back the daily repair walk reaches. Sized to the failure it exists
+# for: a write that failed while the bot was up and connected — a database
+# asleep, a connection blip, a restart mid-write. Those outages are hours, not
+# weeks, and every extra day is a day of history re-read on every run. A gap
+# older than this needs /backfill full:True, which is the deliberate tool for it.
+REPAIR_WINDOW_DAYS = 3
+
+# summarize_daily reads exactly the messages the repair walk writes. A day
+# summarized while its messages are still landing is written from partial
+# history — and the watermark then advances past it, so it is never redone.
+# The two loops are separate on purpose (different jobs, different failure
+# modes) but must never overlap; this is what keeps them apart. The startup
+# catch-up takes it too, so the invariant lives in one place.
+_maintenance_lock = asyncio.Lock()
 
 
 async def _load_switches() -> None:
@@ -255,46 +271,73 @@ async def ask_command(interaction: discord.Interaction, ask: str):
     await interaction.followup.send(answer or "(the investigation produced no answer)")
 
 
+def _storable(message) -> bool:
+    """Whether a message belongs in the store.
+
+    One rule, both write paths — the live one in on_message and the walk here.
+    They have to agree in both directions. A message the live path stores but
+    the walk skips is a row the daily repair can never restore, so a failed
+    live write for it is permanent. A message the walk stores but the live path
+    skips is the same hole with the sign flipped.
+    """
+    if message.author == client.user:
+        return False
+    # An image-only post has content == "" and can never match a search.
+    if not message.content:
+        return False
+    # Replies are their own message type — filtering to `default` alone would
+    # drop exactly the messages reply_to_message_id exists for.
+    return message.type in (discord.MessageType.default, discord.MessageType.reply)
+
+
 async def _walk_channel(
     channel,
     *,
     limit: int | None = None,
     stop_at: int | None = None,
+    after: datetime | None = None,
     progress=None,
 ) -> tuple[int, int, set]:
     """Import a channel's history into the store.
 
-    Returns (stored, scanned, days) — `days` being the calendar days, in
-    CORPUS_TZ, that actually gained messages, so the caller can re-summarize
-    exactly those and nothing else.
+    Returns (stored, scanned, days). `stored` counts only rows that were
+    genuinely new, and `days` only the calendar days (in CORPUS_TZ) those
+    landed on — so the caller re-summarizes exactly what changed. This matters
+    most for the repair walk, which re-reads messages it already has: without
+    the distinction it would report its whole window as changed and pay for a
+    re-summary of every day in it, every night.
 
     Walks newest first, so an interrupted run leaves the more useful half done.
+    Two independent ways to bound it:
+
     `stop_at` is a discord_message_id to stop at: ids are snowflakes, so
     anything at or below one already in the store is already stored, and the
     walk can end there instead of re-reading the whole channel.
+
+    `after` is a hard floor on message age, and the bound that finds gaps.
+    Unlike stop_at it does not stop at the first stored message, so it re-reads
+    a window whether or not those messages are already in — which is the only
+    way to notice one that is missing from the middle. Upserts make re-reading
+    cost nothing but time.
 
     Raises discord.Forbidden if the bot cannot read the channel's history.
     """
     scanned = stored = 0
     days: set = set()
 
-    async for m in channel.history(limit=limit):
+    # oldest_first is explicit because discord.py flips its default to True the
+    # moment `after` is passed, and the early break below reads newest-first.
+    async for m in channel.history(limit=limit, after=after, oldest_first=False):
         # Everything from here down is already in the store (see stop_at).
         if stop_at is not None and m.id <= stop_at:
             break
 
         scanned += 1
 
-        # The rules on_message applies, plus one: skip empty messages. An
-        # image-only post has content == "" and can never match a search.
-        if m.author == client.user or not m.content:
-            continue
-        # Replies are their own message type — filtering to `default` alone
-        # would drop exactly the messages reply_to_message_id exists for.
-        if m.type not in (discord.MessageType.default, discord.MessageType.reply):
+        if not _storable(m):
             continue
 
-        await db.upsert_message(
+        _, inserted = await db.upsert_message(
             discord_message_id=m.id,
             channel_id=m.channel.id,
             author_id=m.author.id,
@@ -304,6 +347,9 @@ async def _walk_channel(
                 m.reference.message_id if m.reference else None
             ),
         )
+        if not inserted:
+            continue
+
         stored += 1
         # The day this message belongs to on the group's clock, not the
         # server's — the same boundary the summarizer cuts on.
@@ -317,16 +363,27 @@ async def _walk_channel(
     return stored, scanned, days
 
 
-async def _catch_up() -> None:
-    """Re-ingest whatever arrived while the process was down.
+async def _catch_up(*, since: datetime | None = None) -> None:
+    """Re-ingest what the live path does not have. Two bounds, one procedure.
 
-    Only channels the store already holds messages for: a channel joins the
-    corpus by being backfilled once, on purpose, and is kept current from then
-    on. Without this, every deploy and crash leaves a permanent hole, since
-    on_message only ever sees messages sent while the bot is connected.
+    Default (startup): walk back only as far as the highest stored id. Cheap,
+    and it covers the ordinary case — messages sent while the process was down
+    are all newer than anything stored.
+
+    `since` (the daily repair): walk a fixed recent window regardless of what
+    is stored. This is the only bound that finds a gap BELOW the highest stored
+    id — a message whose live write failed while the ones after it succeeded.
+    The incremental walk stops at the first message it already has, so it skips
+    such a hole every time it runs, forever.
+
+    Both are limited to channels the store already holds messages for: a channel
+    joins the corpus by being backfilled once, on purpose, and is kept current
+    from then on.
     """
+    tag = "repair" if since else "catch_up"
+
     if not switches["RAG"]:
-        print("[catch_up] skipped: RAG is off", flush=True)
+        print(f"[{tag}] skipped: RAG is off", flush=True)
         return
 
     try:
@@ -334,57 +391,103 @@ async def _catch_up() -> None:
         await db.init_db()
         channel_ids = await db.known_channel_ids()
     except Exception as e:
-        print(f"[catch_up] could not reach the db ({type(e).__name__}: {e})", flush=True)
+        print(f"[{tag}] could not reach the db ({type(e).__name__}: {e})", flush=True)
         return
 
     for channel_id in channel_ids:
         channel = client.get_channel(channel_id)
         if channel is None or not hasattr(channel, "history"):
             # Left the server, deleted, or not visible with the current intents.
-            print(f"[catch_up] {channel_id}: not reachable, skipped", flush=True)
+            print(f"[{tag}] {channel_id}: not reachable, skipped", flush=True)
             continue
 
         try:
-            last_id = await db.last_message_id(channel_id)
-            stored, scanned, days = await _walk_channel(channel, stop_at=last_id)
+            if since is None:
+                stop_at = await db.last_message_id(channel_id)
+                stored, scanned, days = await _walk_channel(channel, stop_at=stop_at)
+            else:
+                stored, scanned, days = await _walk_channel(channel, after=since)
         except discord.Forbidden:
-            print(f"[catch_up] {channel_id}: no Read Message History", flush=True)
+            print(f"[{tag}] {channel_id}: no Read Message History", flush=True)
             continue
         except Exception as e:
             # One bad channel must not stop the others from catching up.
-            print(f"[catch_up] {channel_id}: failed ({type(e).__name__}: {e})", flush=True)
+            print(f"[{tag}] {channel_id}: failed ({type(e).__name__}: {e})", flush=True)
             continue
 
         if scanned:
-            print(f"[catch_up] {channel_id}: {stored} stored, {scanned} scanned", flush=True)
+            print(f"[{tag}] {channel_id}: {stored} stored, {scanned} scanned", flush=True)
 
         # An outage that straddled midnight leaves messages on a day already
         # summarized and marked done. Re-summarize those, or they never enter
-        # the index at all.
+        # the index at all. `stored` counts only genuinely new rows, so a
+        # repair walk that found nothing missing costs no model calls.
         if stored:
             try:
                 written = await summarize.summarize_backfilled(channel_id, days)
                 if written:
-                    print(f"[catch_up] {channel_id}: re-summarized {written} day(s)",
+                    print(f"[{tag}] {channel_id}: re-summarized {written} day(s)",
                           flush=True)
             except Exception as e:
-                print(f"[catch_up] {channel_id}: summarize failed "
+                print(f"[{tag}] {channel_id}: summarize failed "
                       f"({type(e).__name__}: {e})", flush=True)
 
-    print("[catch_up] done", flush=True)
+    print(f"[{tag}] done", flush=True)
 
 
 async def _startup_maintenance() -> None:
-    """Catch the store up, then start the summarizer — in that order.
+    """Catch the store up, then start the timers — in that order.
 
     Ordering is the whole point. summarize_daily runs its body the moment it
     starts, and a day summarized before the catch-up has ingested the rest of
     that day would be written from partial history — with the watermark then
     advanced past it, so it would never be redone.
+
+    repair_daily starts first so its immediate run precedes the first
+    summarization: the startup catch-up above is incremental and cannot see a
+    hole under the high-water mark, so a crash that dropped a write mid-day is
+    still unrepaired at this point. Both loops take _maintenance_lock, so the
+    order they start in is the order they run in.
     """
-    await _catch_up()
+    async with _maintenance_lock:
+        await _catch_up()
+
+    if not repair_daily.is_running():
+        repair_daily.start()
     if not summarize_daily.is_running():
         summarize_daily.start()
+
+
+@tasks.loop(hours=24)
+async def repair_daily() -> None:
+    """Re-walk recent history to restore messages the live path never stored.
+
+    on_message writes each message the moment it arrives, and swallows its own
+    errors so that a sleeping database cannot break the bot. The cost of that
+    choice is that a failed write is silent: the message is simply absent, and
+    nothing downstream can tell. The startup catch-up will not find it either —
+    it stops at the highest stored id, and a hole below that is exactly what it
+    walks past.
+
+    So this walks the last REPAIR_WINDOW_DAYS unconditionally, re-upserting
+    everything in the window. Only rows that were genuinely missing count as
+    stored, so a run that finds nothing wrong is a few hundred idempotent
+    upserts and no model calls at all.
+
+    tasks.loop runs the body immediately on start and every 24h after.
+    """
+    if not switches["RAG"]:
+        print("[repair] skipped: RAG is off", flush=True)
+        return
+
+    since = datetime.now(timezone.utc) - timedelta(days=REPAIR_WINDOW_DAYS)
+    try:
+        async with _maintenance_lock:
+            await _catch_up(since=since)
+    except Exception as e:
+        # A failed run must not kill the timer — the window is re-walked
+        # tomorrow, and the gap it was meant to close is still there to find.
+        print(f"[repair] run failed ({type(e).__name__}: {e})", flush=True)
 
 
 @tasks.loop(hours=24)
@@ -401,16 +504,23 @@ async def summarize_daily() -> None:
         return
 
     try:
-        await db.open_pool()
-        await db.init_db()
-        written = await summarize.run_once()
+        async with _maintenance_lock:
+            await db.open_pool()
+            await db.init_db()
+            written = await summarize.run_once()
     except Exception as e:
         # A failed run must not kill the timer; the next one retries the same
-        # days, because the watermark only advances on success.
+        # days, because a failed day is flagged and retried rather than skipped.
         print(f"[summarize] run failed ({type(e).__name__}: {e})", flush=True)
         return
 
     print(f"[summarize] wrote {written} day summaries", flush=True)
+
+
+@repair_daily.before_loop
+async def _before_repair() -> None:
+    # Nothing can be walked before the gateway is up and the channels resolve.
+    await client.wait_until_ready()
 
 
 @summarize_daily.before_loop
@@ -599,10 +709,18 @@ async def on_message(message):
         print("[on_message] ignoring: bot is off", flush=True)
         return
 
-    if switches["RAG"]:
+    # Store it now, not on a timer: this is the primary write path, and a
+    # message that is not captured as it arrives is only recoverable by
+    # re-reading history. repair_daily does exactly that re-reading, but it is
+    # a backstop for when this fails — never the thing keeping the store
+    # current. _storable is what the repair walk applies too; if this path
+    # stored something that walk would skip, a failed write here could never
+    # be repaired.
+    if switches["RAG"] and _storable(message):
         # RAG defaults to on, so this now runs on a deploy whose database is
         # missing or asleep. Log and keep going: an unhandled exception here
-        # fires on every single message and buries the real error.
+        # fires on every single message and buries the real error. The write is
+        # lost, which is what repair_daily exists to notice.
         try:
             await db.open_pool()
             await db.upsert_message(

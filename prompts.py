@@ -18,12 +18,10 @@ searches.
 ## Choosing search tools (in order of preference)
 1. Structured filters (author, channel, time range, day/hour) — cheapest and
    most reliable. Use them first and use them to narrow every other search.
-2. Keyword search — for names, places, and exact terms. Embeddings are weak
-   on these; keyword search is not.
+2. Keyword search — for names, places, and exact terms the chat used
+   verbatim.
 3. Anchor searches (replies_to, messages_near) — to reconstruct the
    conversation around a message you already found.
-4. Similarity search — last resort, only for "text that means roughly this"
-   when vocabulary won't match exactly.
 
 You may request several searches in one pass when they don't depend on each
 other. Prefer one pass with three independent searches over three passes.
@@ -119,7 +117,9 @@ Rules:
 # Stamped onto every row this prompt produces, so summaries written by an older
 # version can be found and regenerated. Bump it whenever SUMMARY_PROMPT changes
 # in a way that changes what a summary contains.
-SUMMARY_PROMPT_VERSION = "day-summary-v1"
+# v2: the same call now also cuts the day into topical clusters, each with its
+# own summary — the text the embedding index is built from.
+SUMMARY_PROMPT_VERSION = "day-summary-v2"
 
 SUMMARY_PROMPT = """You write the daily summary of a small Discord group chat
 (3 people). Your summary is not written to be enjoyed — it is a RETRIEVAL
@@ -136,6 +136,10 @@ summary, that day is invisible for that name.
    this context will be a maintained wiki of people, places, and running
    threads; for now it is only these summaries, so anything you leave out of a
    summary is lost to the days that follow.
+3. Sometimes CARRY-OVER — the final stretch of the previous day's messages,
+   shown because its topic may run into today. These lines are part of your
+   CLUSTERING input (see Clusters) but NOT part of THE DAY: never summarize
+   them in the prose or facets.
 
 ## Write anchors, not narrative
 An anchor is a specific, searchable token that a future question is likely to
@@ -166,6 +170,24 @@ Your window is exactly one calendar day. Never summarize messages outside it.
   day's window. Treat the end of your day as an arbitrary cut, never an
   ending, and never write a conclusion the messages do not show.
 
+## Clusters
+Besides the day summary, cut the messages into CLUSTERS: contiguous stretches
+of conversation, split wherever the topic significantly changes. These power a
+semantic search index — each cluster's summary is embedded, so it must be as
+anchor-dense as the prose.
+
+- Every message line you were shown — CARRY-OVER lines included — belongs to
+  exactly one cluster. Clusters are contiguous and in order: no gaps, no
+  overlaps, no reordering.
+- `first_id` and `last_id` are message ids copied EXACTLY from the lines.
+  Never invent, round, or retype them from memory.
+- Split on significant topic changes only. A one-line joke or aside inside a
+  conversation does not end a cluster; a real shift of subject does. A quiet
+  day can be a single cluster.
+- Each cluster gets a `topic` (a few words) and a `summary` (1-3 sentences)
+  written under the same anchor rules as the prose: names, places, numbers,
+  and decisions verbatim, sarcasm marked as such.
+
 ## Tone
 This chat is joke-heavy and sarcastic. A sarcastic line recorded as a plain
 fact is a lie the search agent has no way to detect. When something reads as a
@@ -185,15 +207,20 @@ Reply with ONLY this JSON object — no markdown fences, no other text:
     "open_threads": ["what was left unresolved when the day ended"],
     "continues_from": ["threads from earlier days that today advanced"],
     "aliases_observed": {"author id": ["names used for them today"]}
-  }
+  },
+  "clusters": [
+    {"first_id": id, "last_id": id, "topic": "...", "summary": "..."}
+  ]
 }
 
 - `prose`: 150-400 words, chronological, entity-dense. This is what gets read
   once a day has been chosen. Reference message ids inline for anything
-  specific enough to look up.
+  specific enough to look up. Covers THE DAY only, never CARRY-OVER.
 - Any facet array may be empty. Never invent entries to fill one.
 - `decisions[].msg_ids` must be real ids from THE DAY. A decision with no
   message behind it is not a decision.
+- `clusters` covers every message line shown, CARRY-OVER included, in order
+  (see Clusters). It is never empty when there are messages.
 - A quiet day gets a short summary. Never pad.
 """
 

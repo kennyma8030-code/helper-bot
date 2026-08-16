@@ -23,7 +23,6 @@ from prompts import PLANNER_PROMPT, SYNTH_PROMPT
 log = logging.getLogger(__name__)
 
 MODEL = "gemini-3.5-flash"
-EMBED_MODEL = "gemini-embedding-001"
 
 # Hard budget — enforced in code, not by the prompt (specs.md decision 2).
 MAX_PASSES = 16
@@ -81,22 +80,11 @@ TOOLS = types.Tool(function_declarations=[
         name="keyword_search",
         description=(
             "Case-insensitive substring match on message text. Use for names, "
-            "places, and exact terms — embeddings are weak on these."
+            "places, and exact terms the chat used verbatim."
         ),
         parameters=_obj({"term": _s("STRING", "The substring to find"),
                          **_FILTER_PROPS, "limit": _LIMIT},
                         required=["term"]),
-    ),
-    types.FunctionDeclaration(
-        name="similarity_search",
-        description=(
-            "Semantic search: messages whose meaning is close to the query text. "
-            "Last resort, for when vocabulary won't match exactly. Only searches "
-            "messages that have been embedded; may return nothing on a fresh corpus."
-        ),
-        parameters=_obj({"query": _s("STRING", "Text expressing the meaning to find"),
-                         **_FILTER_PROPS, "limit": _LIMIT},
-                        required=["query"]),
     ),
     types.FunctionDeclaration(
         name="replies_to",
@@ -125,18 +113,6 @@ TOOLS = types.Tool(function_declarations=[
 # ---------------------------------------------------------------------------
 # Dispatch — execute one model-requested call against db.py
 # ---------------------------------------------------------------------------
-
-async def _embed_query(text: str) -> list[float]:
-    resp = await client.aio.models.embed_content(
-        model=EMBED_MODEL,
-        contents=text,
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY",
-            output_dimensionality=db.EMBED_DIM,
-        ),
-    )
-    return list(resp.embeddings[0].values)
-
 
 def _split_args(args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Split flat tool args into db-style filters vs everything else."""
@@ -183,9 +159,6 @@ async def _execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]
         )
     elif name == "keyword_search":
         rows = await db.keyword_search(str(rest["term"]), filters=filters or None, limit=limit)
-    elif name == "similarity_search":
-        vec = await _embed_query(str(rest["query"]))
-        rows = await db.similarity_search(vec, filters=filters or None, limit=limit)
     elif name == "replies_to":
         rows = await db.replies_to(int(rest["discord_message_id"]), limit=limit)
     elif name == "messages_near":

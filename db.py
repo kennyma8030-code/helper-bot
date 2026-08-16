@@ -3,23 +3,26 @@
 This is scaffolding for the storage layer described in the project design doc.
 The guiding idea from that doc shapes everything here:
 
-  * ONE table holds both the structured metadata (speaker, category, sentiment,
-    target-person, timestamps) AND the embedding, so a single query can filter
-    and rank together instead of vector-searching and post-filtering.
-  * Retrieval is layered. Vector similarity is one instrument among several.
-    Structured filters, keyword/exact match, anchor-based lookup, and SQL
-    aggregation are first-class and often the *primary* mechanism. Each gets
-    its own function below rather than being bolted onto similarity search.
-  * Classification happens at ingestion, into indexed columns, so pattern
-    questions hit B-tree indexes instead of per-query LLM passes.
+  * ONE table holds the structured metadata (speaker, channel, timestamps and
+    the buckets derived from them), so a single query can filter on any of it.
+  * Retrieval is layered. Structured filters, keyword/exact match, anchor-based
+    lookup, and SQL aggregation are first-class and often the *primary*
+    mechanism. Each gets its own function below.
 
-Nothing here decides the questions the doc leaves open. In particular:
-  * EMBED_DIM is provisional — the embedding model is not chosen yet, so the
-    dimension is read from the environment and defaults to a common value.
-  * `embedding` is nullable: messages can be ingested and classified before
-    (or without) being embedded, which keeps backfill an open question.
-  * Classification columns are nullable and untrusted; the doc treats their
-    noise on joke-heavy chat as an unmeasured risk, not a solved problem.
+Embeddings live on CLUSTERS, not messages. The daily summarizer cuts each
+day's messages into topically coherent stretches and writes a summary of each;
+that summary text is what gets embedded, in a separate resumable pass driven
+off `embedding IS NULL`. Messages themselves carry no vector — the per-message
+embedding column was removed before it was ever populated.
+
+There is no per-message classification either. The `category` / `sentiment` /
+`target_person_id` columns were specced as ingestion-time labels but never
+written by anything, and the design doc already flagged their noise on
+joke-heavy sarcastic chat as an unmeasured risk. Empty nullable columns are
+worse than absent ones: they make filters and rates that silently match
+nothing look available. What they were meant to answer now goes through the
+summarizer's facets and cluster summaries, which carry the message ids that
+back them.
 """
 
 import logging
@@ -56,14 +59,15 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # every day summary, since the boundaries themselves move.
 CORPUS_TZ = ZoneInfo(os.environ.get("CORPUS_TZ", "America/New_York"))
 
-# PROVISIONAL. The embedding model is an open question in the design doc
-# (local sentence-transformers vs. an API model). The vector column and its
-# HNSW index are built to this width, so changing models later means a
-# migration + re-embed. 768 is a common default; do not treat it as committed.
+# Width of the cluster embedding vectors. Pinned to what llm.embed_texts asks
+# gemini-embedding-2 for via output_dimensionality; 768 is one of that model's
+# recommended widths. The vector column and its HNSW index are built to this
+# width, so changing it means a migration. Changing the model means
+# re-embedding every cluster even when the width happens to stay the same.
 EMBED_DIM = int(os.environ.get("EMBED_DIM", "768"))
 
-# Distance operator for similarity search. Must match how the chosen embedding
-# model was trained/normalised: <=> cosine, <-> L2, <#> (neg) inner product.
+# Distance operator for the future cluster search path. Cosine, matching
+# gemini-embedding-2 (llm.embed_texts normalises the vectors it stores).
 DISTANCE_OP = "<=>"
 
 
@@ -73,7 +77,7 @@ DISTANCE_OP = "<=>"
 # day_of_week (0-6) and hour_of_day (0-23) are stored as plain columns computed
 # at ingestion rather than generated columns: EXTRACT over timestamptz is not
 # immutable (it depends on the session time zone), so it can't back a generated
-# column. Computing them once at ingest also fits "classified at ingestion".
+# column. Computing them once at ingest keeps the filters index-backed.
 
 SCHEMA_DDL = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -93,38 +97,78 @@ CREATE TABLE IF NOT EXISTS messages (
 
     -- Derived-at-ingest temporal buckets for pattern/aggregation queries.
     day_of_week         smallint    NOT NULL,   -- 0=Monday .. 6=Sunday
-    hour_of_day         smallint    NOT NULL,   -- 0..23, in CORPUS_TZ
-
-    -- Ingestion-time classification. Nullable and untrusted (see module doc).
-    category            text,                   -- e.g. proposal/complaint/...
-    sentiment           text,
-    target_person_id    bigint,                 -- who a message is "about"
-
-    -- Nullable so a message can exist before it is embedded (backfill is open).
-    embedding           vector({EMBED_DIM})
+    hour_of_day         smallint    NOT NULL    -- 0..23, in CORPUS_TZ
 );
 
--- Selective equality filters (per-person, per-target) are meant to pre-filter
--- via B-tree indexes; for those, the exact scan over the narrowed set beats an
--- approximate vector index. See similarity_search() for the interaction.
+-- Migrations. Both columns sets below were specced, indexed, and never written
+-- by anything: embeddings moved to clusters before the embedding pipeline ran,
+-- and per-message classification was dropped rather than built (see module
+-- doc). They are NULL in every row of every database that has them, so these
+-- drops lose no data. Idempotent, like the rest of this DDL.
+DROP INDEX IF EXISTS messages_embedding_idx;
+ALTER TABLE messages DROP COLUMN IF EXISTS embedding;
+
+DROP INDEX IF EXISTS messages_category_idx;
+DROP INDEX IF EXISTS messages_target_idx;
+DROP INDEX IF EXISTS messages_author_cat_idx;
+ALTER TABLE messages DROP COLUMN IF EXISTS category;
+ALTER TABLE messages DROP COLUMN IF EXISTS sentiment;
+ALTER TABLE messages DROP COLUMN IF EXISTS target_person_id;
+
+-- Selective equality filters (per-person, per-channel) hit these B-tree
+-- indexes directly.
 CREATE INDEX IF NOT EXISTS messages_author_idx        ON messages (author_id);
-CREATE INDEX IF NOT EXISTS messages_target_idx        ON messages (target_person_id);
 CREATE INDEX IF NOT EXISTS messages_channel_idx       ON messages (channel_id);
-CREATE INDEX IF NOT EXISTS messages_category_idx      ON messages (category);
 CREATE INDEX IF NOT EXISTS messages_created_at_idx    ON messages (created_at);
 CREATE INDEX IF NOT EXISTS messages_reply_to_idx      ON messages (reply_to_message_id);
-CREATE INDEX IF NOT EXISTS messages_author_cat_idx    ON messages (author_id, category);
 CREATE INDEX IF NOT EXISTS messages_dow_hour_idx      ON messages (day_of_week, hour_of_day);
-
--- Approximate index for weakly-filtered similarity search. When filters are
--- highly selective this index is deliberately bypassed (planner's choice);
--- it earns its keep on broad searches across the whole corpus.
--- TODO: revisit ef_search / m once the embedding model and data volume settle.
-CREATE INDEX IF NOT EXISTS messages_embedding_idx
-    ON messages USING hnsw (embedding vector_cosine_ops);
 
 -- TODO: keyword_search() uses ILIKE for now. For real term/name matching add
 -- a pg_trgm GIN index or a tsvector column; embeddings are weak on exact names.
+
+-- Topical clusters: contiguous stretches of one channel's messages, cut by the
+-- daily summarizer where it saw the topic change. The `summary` text is what
+-- gets embedded — a separate pass fills `embedding` wherever it is NULL, so
+-- generation and embedding can fail and retry independently.
+--
+-- A cluster may span midnight: each day's run re-cuts the previous day's final
+-- cluster together with the new day's messages, since a cluster cut at a day
+-- boundary was cut blind to how the conversation continued.
+CREATE TABLE IF NOT EXISTS clusters (
+    id                  bigserial   PRIMARY KEY,
+    channel_id          bigint      NOT NULL,
+
+    -- Drill-down range, like day_summaries: discord ids, inclusive both ends.
+    first_message_id    bigint      NOT NULL,
+    last_message_id     bigint      NOT NULL,
+    started_at          timestamptz NOT NULL,   -- created_at of first message
+    ended_at            timestamptz NOT NULL,   -- created_at of last message
+    message_count       integer     NOT NULL,
+
+    topic               text,                   -- few-word label, for humans
+    summary             text        NOT NULL,   -- the text that gets embedded
+
+    embedding           vector({EMBED_DIM}),    -- NULL until the embed pass
+    embed_model         text,                   -- set when embedded
+    embedded_at         timestamptz,
+
+    model               text        NOT NULL,   -- what wrote the summary
+    prompt_version      text        NOT NULL,
+    generated_at        timestamptz NOT NULL DEFAULT now(),
+
+    -- Clusters for one channel never overlap; re-runs replace by span, and
+    -- this catches any bug that would insert two clusters starting together.
+    UNIQUE (channel_id, first_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS clusters_span_idx
+    ON clusters (channel_id, started_at, ended_at);
+-- The embed pass walks exactly this: everything not yet embedded, in order.
+CREATE INDEX IF NOT EXISTS clusters_pending_idx
+    ON clusters (id) WHERE embedding IS NULL;
+-- For the future cluster-similarity read path (not exposed to the planner yet).
+CREATE INDEX IF NOT EXISTS clusters_embedding_idx
+    ON clusters USING hnsw (embedding vector_cosine_ops);
 
 -- LLM-written summaries: the retrieval index over the corpus (specs-summaries.md).
 -- Derived and regenerable — messages are the ground truth, these are a lossy
@@ -185,6 +229,21 @@ CREATE TABLE IF NOT EXISTS summary_state (
     channel_id          bigint      PRIMARY KEY,
     summarized_through  date        NOT NULL,
     updated_at          timestamptz NOT NULL DEFAULT now()
+);
+
+-- Days whose summarize/cluster run failed. The watermark advances PAST a
+-- failed day once it is flagged here (a flagged day is retryable, so the gap
+-- is not permanent), and every run retries flagged days before doing new ones.
+-- Embedding failures are not flagged here — an unembedded cluster is its own
+-- flag (embedding IS NULL) and is retried by the embed pass automatically.
+CREATE TABLE IF NOT EXISTS summary_failures (
+    channel_id          bigint      NOT NULL,
+    day                 date        NOT NULL,
+    stage               text        NOT NULL,   -- 'summary' | 'clusters'
+    error               text,
+    attempts            integer     NOT NULL DEFAULT 1,
+    last_failed_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (channel_id, day)
 );
 
 -- Durable feature switches. The bot keeps these in memory to read them for
@@ -316,7 +375,7 @@ async def clear_channel(channel_id: int) -> dict[str, int]:
     that. The schema itself is left in place; this empties rows, it does not
     drop tables.
 
-    All three deletes share one transaction, so a reset either lands whole or
+    All the deletes share one transaction, so a reset either lands whole or
     not at all — no run can leave summaries pointing at messages that are gone.
     """
     pool = _get_pool()
@@ -330,25 +389,37 @@ async def clear_channel(channel_id: int) -> dict[str, int]:
             )
             summaries = cur.rowcount
             await cur.execute(
+                "DELETE FROM clusters WHERE channel_id = %s", (channel_id,)
+            )
+            clusters = cur.rowcount
+            await cur.execute(
                 "DELETE FROM messages WHERE channel_id = %s", (channel_id,)
             )
             messages = cur.rowcount
             # The watermark has to go too, or the summarizer believes the
             # channel is caught up through a date whose messages no longer
-            # exist and never re-reads it.
+            # exist and never re-reads it. Same for failure flags: a flagged
+            # day would be retried against messages that are gone.
             await cur.execute(
                 "DELETE FROM summary_state WHERE channel_id = %s", (channel_id,)
             )
             watermarks = cur.rowcount
+            await cur.execute(
+                "DELETE FROM summary_failures WHERE channel_id = %s", (channel_id,)
+            )
+            failures = cur.rowcount
 
     log.info(
-        "cleared channel %d: %d messages, %d summaries, %d watermarks",
-        channel_id, messages, summaries, watermarks,
+        "cleared channel %d: %d messages, %d summaries, %d clusters, "
+        "%d watermarks, %d failure flags",
+        channel_id, messages, summaries, clusters, watermarks, failures,
     )
     return {
         "messages": messages,
         "summaries": summaries,
+        "clusters": clusters,
         "watermarks": watermarks,
+        "failures": failures,
     }
 
 
@@ -407,18 +478,23 @@ async def upsert_message(
     content: str,
     created_at: datetime,
     reply_to_message_id: Optional[int] = None,
-    category: Optional[str] = None,
-    sentiment: Optional[str] = None,
-    target_person_id: Optional[int] = None,
-    embedding: Optional[Sequence[float]] = None,
-) -> int:
-    """Insert a message (or update it if already ingested). Returns the row id.
+) -> tuple[int, bool]:
+    """Insert a message (or update it if already ingested).
+
+    Returns (row id, inserted) — `inserted` being True only when the row is
+    genuinely new. The repair walk re-reads messages it already has, and that
+    flag is what stops it from re-summarizing (and re-embedding) days where
+    nothing was actually missing. `xmax = 0` is the standard way to ask
+    Postgres which half of an upsert happened: a row this statement inserted
+    has no update transaction stamped on it.
+
+    An edit to an already-stored message reads as not-inserted, so it does not
+    trigger re-summarization. That matches the rest of the bot, which has no
+    edit handling at all.
 
     day_of_week / hour_of_day are derived here from created_at, in CORPUS_TZ —
     they exist to answer "who posts late at night", and that question is about
     the group's clock, not the server's. The timestamp itself stays UTC.
-    Classification and embedding are optional so ingestion, classification, and
-    embedding can be separate passes (keeps backfill/embedding strategy open).
     """
     created_at = _as_utc(created_at)
     local = created_at.astimezone(CORPUS_TZ)
@@ -428,29 +504,23 @@ async def upsert_message(
     sql = """
         INSERT INTO messages (
             discord_message_id, channel_id, author_id, content, created_at,
-            reply_to_message_id, day_of_week, hour_of_day,
-            category, sentiment, target_person_id, embedding
+            reply_to_message_id, day_of_week, hour_of_day
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (discord_message_id) DO UPDATE SET
             content             = EXCLUDED.content,
-            reply_to_message_id = EXCLUDED.reply_to_message_id,
-            category            = COALESCE(EXCLUDED.category, messages.category),
-            sentiment           = COALESCE(EXCLUDED.sentiment, messages.sentiment),
-            target_person_id    = COALESCE(EXCLUDED.target_person_id, messages.target_person_id),
-            embedding           = COALESCE(EXCLUDED.embedding, messages.embedding)
-        RETURNING id
+            reply_to_message_id = EXCLUDED.reply_to_message_id
+        RETURNING id, (xmax = 0) AS inserted
     """
     params = (
         discord_message_id, channel_id, author_id, content, created_at,
         reply_to_message_id, day_of_week, hour_of_day,
-        category, sentiment, target_person_id, embedding,
     )
     pool = _get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(sql, params)
         row = await cur.fetchone()
-    return row["id"]
+    return row["id"], row["inserted"]
 
 
 async def known_channel_ids() -> list[int]:
@@ -480,36 +550,6 @@ async def last_message_id(channel_id: int) -> Optional[int]:
         )
         row = await cur.fetchone()
     return row["last"] if row else None
-
-
-async def set_classification(
-    discord_message_id: int,
-    *,
-    category: Optional[str] = None,
-    sentiment: Optional[str] = None,
-    target_person_id: Optional[int] = None,
-) -> None:
-    """Attach/replace ingestion-time classification for one message."""
-    sql = """
-        UPDATE messages
-           SET category         = COALESCE(%s, category),
-               sentiment        = COALESCE(%s, sentiment),
-               target_person_id = COALESCE(%s, target_person_id)
-         WHERE discord_message_id = %s
-    """
-    pool = _get_pool()
-    async with pool.connection() as conn:
-        await conn.execute(sql, (category, sentiment, target_person_id, discord_message_id))
-
-
-async def set_embedding(discord_message_id: int, embedding: Sequence[float]) -> None:
-    """Attach/replace the embedding for one message (separate pass from ingest)."""
-    pool = _get_pool()
-    async with pool.connection() as conn:
-        await conn.execute(
-            "UPDATE messages SET embedding = %s WHERE discord_message_id = %s",
-            (embedding, discord_message_id),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -550,9 +590,6 @@ async def set_switch(key: str, value: bool) -> None:
 _EQ_FIELDS = {
     "author_id",
     "channel_id",
-    "category",
-    "sentiment",
-    "target_person_id",
     "day_of_week",
     "hour_of_day",
     "reply_to_message_id",
@@ -589,40 +626,7 @@ def _build_where(filters: Optional[dict[str, Any]]) -> tuple[str, list[Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Retrieval instrument 1: vector similarity (with structured filters)
-# ---------------------------------------------------------------------------
-
-async def similarity_search(
-    query_embedding: Sequence[float],
-    *,
-    filters: Optional[dict[str, Any]] = None,
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """Rank messages by embedding distance, optionally within a filtered subset.
-
-    Filter + rank happen in one statement (the whole point of co-locating
-    metadata and vectors). When the filters are selective the planner will
-    pre-filter via B-tree and scan exactly; when they are broad it can lean on
-    the HNSW index. Each row includes a `distance` column (smaller = closer).
-    """
-    where, params = _build_where(filters)
-    # Only rank rows that are actually embedded; fold that into the WHERE.
-    where = f"{where} AND embedding IS NOT NULL" if where else "WHERE embedding IS NOT NULL"
-    sql = f"""
-        SELECT *, embedding {DISTANCE_OP} %s AS distance
-          FROM messages
-          {where}
-        ORDER BY embedding {DISTANCE_OP} %s
-         LIMIT %s
-    """
-    pool = _get_pool()
-    async with pool.connection() as conn:
-        cur = await conn.execute(sql, [query_embedding, *params, query_embedding, limit])
-        return await cur.fetchall()
-
-
-# ---------------------------------------------------------------------------
-# Retrieval instrument 2: structured filter (pure SQL, no vectors)
+# Retrieval instrument 1: structured filter (pure SQL, no vectors)
 # ---------------------------------------------------------------------------
 
 async def structured_search(
@@ -637,7 +641,7 @@ async def structured_search(
     """
     allowed = {
         "created_at ASC", "created_at DESC",
-        "author_id", "category", "id ASC", "id DESC",
+        "author_id", "id ASC", "id DESC",
     }
     if order_by not in allowed:
         raise ValueError(f"order_by must be one of {sorted(allowed)}")
@@ -651,7 +655,7 @@ async def structured_search(
 
 
 # ---------------------------------------------------------------------------
-# Retrieval instrument 3: keyword / exact match
+# Retrieval instrument 2: keyword / exact match
 # ---------------------------------------------------------------------------
 
 async def keyword_search(
@@ -675,7 +679,7 @@ async def keyword_search(
 
 
 # ---------------------------------------------------------------------------
-# Retrieval instrument 4: anchor-based (structural, not semantic)
+# Retrieval instrument 3: anchor-based (structural, not semantic)
 # ---------------------------------------------------------------------------
 
 async def replies_to(discord_message_id: int, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -718,7 +722,7 @@ async def messages_near(
 
 
 # ---------------------------------------------------------------------------
-# Retrieval instrument 5: aggregation (computed in SQL, never eyeballed)
+# Retrieval instrument 4: aggregation (computed in SQL, never eyeballed)
 # ---------------------------------------------------------------------------
 # The doc is emphatic: pattern claims need denominators. "C mentions hiking
 # less" is meaningless without C's total message volume. These return rates,
@@ -737,30 +741,11 @@ async def message_counts_by_author(
         return await cur.fetchall()
 
 
-async def category_rate_by_author(
-    category: str,
-    *,
-    filters: Optional[dict[str, Any]] = None,
-) -> list[dict[str, Any]]:
-    """Per-author rate of a category: matching count over total, with the raw
-    numbers alongside so small samples are visible (silence/low-N is weak
-    evidence and must stay inspectable).
-    """
-    where, params = _build_where(filters)
-    sql = f"""
-        SELECT author_id,
-               COUNT(*) FILTER (WHERE category = %s) AS matching,
-               COUNT(*)                              AS total,
-               COUNT(*) FILTER (WHERE category = %s)::float
-                   / NULLIF(COUNT(*), 0)             AS rate
-          FROM messages
-          {where}
-      GROUP BY author_id
-    """
-    pool = _get_pool()
-    async with pool.connection() as conn:
-        cur = await conn.execute(sql, [category, *params, category])
-        return await cur.fetchall()
+# category_rate_by_author lived here. It computed a per-author rate as
+# "messages with category = X over that author's total", and went with the
+# column. The denominator half survives above; a numerator now has to come
+# from something that actually exists in a row — a keyword match, a time
+# bucket — rather than a label nothing ever wrote.
 
 
 # ---------------------------------------------------------------------------
@@ -919,6 +904,177 @@ async def set_summary_watermark(channel_id: int, through: date) -> None:
     pool = _get_pool()
     async with pool.connection() as conn:
         await conn.execute(sql, (channel_id, through))
+
+
+# ---------------------------------------------------------------------------
+# Clusters — topical stretches, written by the summarizer, embedded separately
+# ---------------------------------------------------------------------------
+
+async def latest_cluster(channel_id: int) -> Optional[dict[str, Any]]:
+    """The channel's most recent cluster, or None.
+
+    This is what the next day's run re-cuts: its start message is where that
+    run's clustering input begins, so the cluster gets re-drawn with the new
+    day's context instead of staying cut blind at midnight.
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM clusters WHERE channel_id = %s "
+            "ORDER BY first_message_id DESC LIMIT 1",
+            (channel_id,),
+        )
+        return await cur.fetchone()
+
+
+async def clusters_overlapping(
+    channel_id: int, start: datetime, end: datetime
+) -> list[dict[str, Any]]:
+    """Clusters whose span intersects [start, end), oldest first.
+
+    A re-run of a day must replace these whole, never trim them — so the
+    caller extends its input window back to the earliest one's start.
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM clusters WHERE channel_id = %s "
+            "AND started_at < %s AND ended_at >= %s "
+            "ORDER BY first_message_id ASC",
+            (channel_id, _as_utc(end), _as_utc(start)),
+        )
+        return await cur.fetchall()
+
+
+async def replace_clusters(
+    channel_id: int,
+    window_start: datetime,
+    window_end: datetime,
+    clusters: Sequence[dict[str, Any]],
+) -> tuple[int, int]:
+    """Swap the clusters covering one window for a new set, atomically.
+
+    Deletes every cluster intersecting [window_start, window_end), then
+    inserts the new rows — one transaction, so no crash can leave the window
+    half-clustered or doubly clustered. New rows have no embedding yet; the
+    embed pass finds them via embedding IS NULL.
+
+    Returns (deleted, inserted).
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM clusters WHERE channel_id = %s "
+                "AND started_at < %s AND ended_at >= %s",
+                (channel_id, _as_utc(window_end), _as_utc(window_start)),
+            )
+            deleted = cur.rowcount
+            for c in clusters:
+                await cur.execute(
+                    """
+                    INSERT INTO clusters (
+                        channel_id, first_message_id, last_message_id,
+                        started_at, ended_at, message_count,
+                        topic, summary, model, prompt_version
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        channel_id,
+                        c["first_message_id"], c["last_message_id"],
+                        _as_utc(c["started_at"]), _as_utc(c["ended_at"]),
+                        c["message_count"],
+                        c.get("topic"), c["summary"],
+                        c["model"], c["prompt_version"],
+                    ),
+                )
+    return deleted, len(clusters)
+
+
+async def unembedded_clusters(limit: int = 64) -> list[dict[str, Any]]:
+    """Clusters still waiting for a vector, oldest first — the embed pass's
+    work queue. Every channel's pending rows, since embedding is corpus-wide."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM clusters WHERE embedding IS NULL ORDER BY id LIMIT %s",
+            (limit,),
+        )
+        return await cur.fetchall()
+
+
+async def set_cluster_embedding(
+    cluster_id: int, embedding: Sequence[float], embed_model: str
+) -> None:
+    """Attach one cluster's vector, recording what produced it."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE clusters SET embedding = %s, embed_model = %s, "
+            "embedded_at = now() WHERE id = %s",
+            (embedding, embed_model, cluster_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Summary failure flags — how a failed day stays retryable
+# ---------------------------------------------------------------------------
+# The watermark advances past a failed day only once it is flagged here, and
+# every run retries flagged days before starting new ones — so a failure costs
+# retries, never a silent permanent gap.
+
+async def flag_summary_failure(
+    channel_id: int, day: date, *, stage: str, error: str
+) -> None:
+    """Record that a day's run failed at `stage` ('summary' or 'clusters')."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO summary_failures (channel_id, day, stage, error)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (channel_id, day) DO UPDATE
+               SET stage = EXCLUDED.stage,
+                   error = EXCLUDED.error,
+                   attempts = summary_failures.attempts + 1,
+                   last_failed_at = now()
+            """,
+            (channel_id, day, stage, error[:2000]),
+        )
+
+
+async def clear_summary_failure(channel_id: int, day: date) -> None:
+    """Drop a day's flag after a successful run. No-op if it was never set."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "DELETE FROM summary_failures WHERE channel_id = %s AND day = %s",
+            (channel_id, day),
+        )
+
+
+async def summary_failed(channel_id: int, day: date) -> bool:
+    """Whether a day is currently flagged as failed."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT 1 FROM summary_failures WHERE channel_id = %s AND day = %s",
+            (channel_id, day),
+        )
+        return await cur.fetchone() is not None
+
+
+async def failed_summary_days(channel_id: int) -> list[date]:
+    """Every flagged day for one channel, oldest first — the retry queue."""
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT day FROM summary_failures WHERE channel_id = %s ORDER BY day",
+            (channel_id,),
+        )
+        rows = await cur.fetchall()
+    return [row["day"] for row in rows]
 
 
 # ---------------------------------------------------------------------------

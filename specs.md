@@ -219,8 +219,11 @@ can confirm. Design constraints when built:
 ## Data & epistemic discipline
 
 - `[v1]` Temporal precedence (later statements supersede, per speaker)
-- `[v1]` Normalization (per-person rates against overall message volume —
-  db.py aggregation functions return rates with denominators)
+- `[v1-lite]` Normalization (per-person rates against overall message volume).
+  `db.message_counts_by_author` still supplies the denominator; the rate
+  function that went with it was `category_rate_by_author`, removed on
+  2026-08-16 with the `category` column. A numerator needs a new basis — see
+  the Infrastructure note below.
 - `[v1]` Small-sample hedging in synthesis (raw counts always alongside
   rates)
 - `[v1-lite]` Silence-as-weak-evidence handling — prompt-level rule in v1;
@@ -229,11 +232,21 @@ can confirm. Design constraints when built:
 
 ## Infrastructure
 
-- `[v1]` pgvector: structured + vector in one Postgres table, no sync problem
-- `[v1]` HNSW indexing (built; tuning deferred until data volume exists)
+- `[v1]` pgvector: Postgres holds the structured columns and the vectors, no
+  sync problem. **Revised 2026-08-16:** the vectors are on `clusters`, not on
+  `messages` — see specs-summaries.md's addendum.
+- `[v1]` HNSW indexing (built over `clusters.embedding`; tuning deferred until
+  data volume exists)
 - `[later]` Filtered-ANN degradation and quantization (scale awareness —
   document the tradeoff, irrelevant at 3-person volume)
-- `[v1]` Async ingestion (fire-and-forget classification, non-blocking bot)
+- ~~`[v1]` Async ingestion (fire-and-forget classification, non-blocking bot)~~
+  **Dropped 2026-08-16.** Per-message classification (`category`, `sentiment`,
+  `target_person_id`) was specced and indexed but never written by anything,
+  and this doc already flagged its noise on joke-heavy sarcastic chat as an
+  unmeasured risk. The columns are gone. Nullable columns nothing populates
+  are worse than no columns: they make filters and rates that match nothing
+  look available. What they were meant to answer is now carried by the
+  summarizer's facets and cluster summaries, which cite message ids.
 - `[later]` Synthetic evaluation via persona-seeded bot conversations with
   known ground truth — the eval substrate in v1 is trajectory logs
 

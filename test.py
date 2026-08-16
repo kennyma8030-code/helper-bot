@@ -296,7 +296,8 @@ async def reset(interaction: discord.Interaction, confirm: bool):
         await db.init_db()
         rows = await db.clear_channel(channel.id)
         db_line = (
-            f"Database: {rows['messages']} messages, {rows['summaries']} summaries."
+            f"Database: {rows['messages']} messages, {rows['summaries']} summaries, "
+            f"{rows['clusters']} clusters."
         )
     except Exception as e:
         # No database is a normal state for this service — it does not need one

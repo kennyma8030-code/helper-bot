@@ -1,5 +1,10 @@
 # Day Summaries — Spec
 
+> **2026-08-16:** the vector path changed shape — per-message embeddings are
+> gone; the summarizer now also cuts topical clusters whose summaries are what
+> gets embedded. See the Addendum at the bottom; parts of this spec it
+> supersedes are marked inline.
+
 Adds a third retrieval path alongside the existing two: LLM-written daily
 summaries that act as an index into the corpus, sitting next to exact/keyword
 match over raw messages and metadata-filtered vector search.
@@ -78,7 +83,9 @@ The loop, ledger, budgets, and triage are unchanged by this.
     has run, `similarity_search` returning nothing is indistinguishable from
     "no messages match" — the model ledgers a false dead branch. Any search
     over an unpopulated index reports coverage explicitly ("0 of N messages
-    embedded") rather than an empty row list.
+    embedded") rather than an empty row list. *(Applied in its strongest form
+    on 2026-08-16: the dead tool was removed from the planner entirely — see
+    Addendum.)*
 
 ## Limitations of LLM summaries
 
@@ -191,21 +198,16 @@ actually missing. The vector path is unblocked after, not deleted.
    optional channel, returning summaries for that span. This is where it
    becomes clear whether the summaries are good enough to retrieve on.
 
-3. **Stop the vector path lying.** Cheap and independent of everything else:
-   implement decision 10, so `similarity_search` over an unembedded corpus
-   reports its coverage instead of returning an empty row list the model reads
-   as "nothing matched."
+3. ~~**Stop the vector path lying.**~~ **Superseded (see Addendum):** the
+   per-message vector path was removed outright — `similarity_search` and the
+   planner's tool for it no longer exist, which is the stronger form of "a
+   dead tool must never look like an empty result."
 
-4. **Finish the vector path.** Everything is in place except the one thing
-   that makes it work: `set_embedding` (`db.py:321`) has no caller. Write the
-   embedding job — a backfill over existing history plus an ongoing pass for
-   new messages, batched, resumable, and driven off `embedding IS NULL` so it
-   is safe to re-run. Two things must be settled first, because changing
-   either invalidates every stored vector: pin the embedding model (`EMBED_DIM`
-   at `db.py:50` is provisional at 768 and must match the chosen model's real
-   output width, which `_embed_query` in `loop.py:132` already requests via
-   `output_dimensionality`), and confirm `DISTANCE_OP` (`db.py:54`, currently
-   cosine `<=>`) matches how that model normalizes.
+4. ~~**Finish the vector path.**~~ **Superseded (see Addendum):** embeddings
+   now live on clusters, not messages, and the embed job exists
+   (`summarize.embed_pending`, batched, resumable, driven off
+   `embedding IS NULL`). The model is pinned: `gemini-embedding-2` at
+   `EMBED_DIM` 768, cosine, normalized in `llm.embed_texts`.
 
 5. **Report match counts.** Every search in `_execute_call` caps at 30 rows
    (`MAX_ROWS_PER_CALL`) with no signal that more existed. Run `COUNT(*)`
@@ -231,16 +233,13 @@ meantime.
   invalidates every stored bucket and every summary, since the boundaries
   themselves move.
 
-- **Which embedding model.** Blocks build order step 4 and nothing else.
-  `EMBED_DIM` (`db.py:50`) is a provisional 768 and `DISTANCE_OP` (`db.py:54`)
-  a provisional cosine; both are properties of the model, not choices to make
-  independently. Pinning this late is fine — pinning it twice is not, since
-  the second choice means re-embedding the whole corpus.
+- ~~**Which embedding model.**~~ **Settled: `gemini-embedding-001` at 768
+  dimensions, cosine** (`llm.EMBED_MODEL` / `db.EMBED_DIM`). Changing either
+  means re-embedding every stored cluster vector.
 
-- **Whether to embed summaries too.** `prose` is exactly the kind of text
-  embeddings are good at, and a vector index over summaries would be a
-  cheaper, coarser semantic search than one over every message. Not decided;
-  revisit once step 4 has run and both paths are real.
+- ~~**Whether to embed summaries too.**~~ **Settled, in a stronger form (see
+  Addendum):** LLM-written cluster summaries are the *only* thing embedded —
+  the per-message vector path was removed rather than finished.
 
 ## Deferred — with triggers
 
@@ -254,9 +253,71 @@ meantime.
   find an entity's date range is the bottleneck. Build as a rollup over
   facets, not a second ingestion path; pages append claims with message-id
   provenance rather than being rewritten.
-- **Aggregation tools** → `db.py` already has `message_counts_by_author` and
-  friends, unexposed in `TOOLS`, which is why `PLANNER_PROMPT` says "you
-  cannot count." Exposing them (plus per-day counts stored at summary time)
-  removes that restriction.
+- **Aggregation tools** → `db.py` has `message_counts_by_author`, unexposed in
+  `TOOLS`, which is why `PLANNER_PROMPT` says "you cannot count." Exposing it
+  (plus per-day counts stored at summary time) removes that restriction. Note
+  it is now the only aggregation function: `category_rate_by_author` was
+  removed with the `category` column on 2026-08-16, so the numerator side
+  needs a basis that exists in a row — a keyword match or a time bucket.
 - **Alias-expanded keyword search** → `aliases_observed` accumulates enough
   that exact match is demonstrably missing people by nickname.
+
+## Addendum — cluster embeddings (2026-08-16)
+
+The per-message vector path was removed before it ever ran, and replaced with
+embeddings over **topical clusters**. What changed and why:
+
+1. **The daily summarize call also cuts clusters.** The same Gemini call that
+   writes a day's prose + facets now returns `clusters`: contiguous stretches
+   of the day's messages, split where the topic significantly changed, each
+   with a few-word `topic`, a 1–3 sentence anchor-dense `summary`, and its
+   boundary message ids **copied from the input lines** (never counted —
+   models copy reliably and count badly). Code validates that the clusters
+   exactly partition the input: ids real, in order, no gaps, no overlaps.
+
+2. **Cluster summaries are what gets embedded**, into a dedicated `clusters`
+   table (`db.py`) — not the messages, not the day prose. `messages.embedding`
+   and `similarity_search` are gone; the planner keeps structured/keyword/
+   anchor tools only. A cluster-similarity read path over the new table is a
+   later, separate change (the HNSW index for it already exists).
+
+3. **Generation and embedding are separate stages.** Clusters are stored with
+   `embedding IS NULL`; `summarize.embed_pending()` fills every NULL in
+   batches after each run. An embedding outage costs nothing — the NULL is the
+   retry flag. Model pinned: `gemini-embedding-2`, 768 dims, cosine,
+   normalized (`llm.embed_texts`); embed spend is recorded in `api_usage`.
+   Task instructions are text prefixes (`llm.as_document` / `llm.as_query`),
+   not the `task_type` field — this model accepts that field and silently
+   ignores it. Each text goes in its own `Content`; passing bare strings
+   returns one aggregated vector for the whole batch, verified against the
+   live API on 2026-08-16.
+
+4. **Midnight cuts are healed by re-cutting.** Each day's run extends its
+   clustering input back to the start of the previous day's *final* cluster
+   and replaces it — that cluster was cut blind to how the conversation
+   continued, so it is re-drawn with the new day in view and may span
+   midnight. Skipped when the previous day failed or had no messages. The day
+   *summary* still covers exactly the calendar day; only clusters cross it.
+
+5. **Failures are flagged, not blocking.** A failed day (model call, bad JSON,
+   or invalid clusters) is recorded in `summary_failures` and the watermark
+   advances past it; every later run retries flagged days before starting new
+   ones. This replaces "the watermark never advances over an unsummarized
+   day" — the flag is what keeps the gap from becoming permanent. If the
+   prose was good but the clusters were not, the summary is stored and the
+   day flagged `stage='clusters'`; the retry redoes the whole call (the
+   upsert makes that harmless).
+
+6. **Per-message classification was dropped with it.** `messages.category`,
+   `sentiment`, and `target_person_id` were specced as ingestion-time labels
+   and indexed, but nothing ever wrote them — the same "dead instrument that
+   looks alive" problem as the empty vector column, and `specs.md` had already
+   flagged their noise on sarcastic chat as unmeasured. Removed, along with
+   `set_classification`, `category_rate_by_author`, their three indexes, and
+   their entries in the filter whitelist. Facets and cluster summaries carry
+   this now, with message ids behind them.
+
+Known, accepted limitation: contiguous ranges cannot represent interleaved
+conversations — a stretch that braids two topics becomes one cluster. Ranges
+are what make validation and drill-down mechanical; topical purity is not
+promised.
