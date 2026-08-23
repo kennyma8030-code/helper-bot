@@ -160,8 +160,6 @@ PLAN_TWO = {"sub_questions": [
 ], "note": "split on date and driver"}
 
 GRADE_RESOLVED = {
-    "graded": [{"message_id": "1401", "score": 0.9, "why": "states the conflict"},
-               {"message_id": "1402", "score": 0.8, "why": "proposes the new date"}],
     "facts": [{"claim": "the cabin trip moved to the 17th",
                "citations": {"1402": "so we push it to the 17th?"}}],
     "inferences": [{"claim": "the move was driven by the brother's move",
@@ -189,8 +187,7 @@ async def case_happy():
 
 
 async def case_two_waves():
-    refine = dict(GRADE_RESOLVED, status="refine", gap="whether Sam agreed",
-                  graded=[{"message_id": "1401", "score": 0.3, "why": "weak"}])
+    refine = dict(GRADE_RESOLVED, status="refine", gap="whether Sam agreed")
     wave2 = {"sub_questions": [{"sub_question": "did Sam agree to the 17th",
                                 "priority": 1, "rationale": "the gap",
                                 "expected_answer_type": "yes/no"}], "note": "chase it"}
@@ -201,11 +198,35 @@ async def case_two_waves():
     install(s)
     run = await loop.investigate("why did the cabin trip move?")
     assert run.waves == 2 and run.verdict == "yes"
-    # A 0.3 top score is under escalate_score, so the second round goes large.
+    # Unresolved entering the last round, so that round goes to the large model.
     assert loop.LARGE_MODEL in s.models_for("worker")
     assert run.trajectory[0]["results"][0]["escalated"] is True
     assert run.trajectory[1]["sub_questions"] == ["did Sam agree to the 17th"]
-    return f"waves={run.waves} escalated=True calls={run.llm_calls}"
+    return f"waves={run.waves} escalated on final round, calls={run.llm_calls}"
+
+
+async def case_escalate_on_ambiguous():
+    """The other trigger: a grader that says it cannot tell, before the last
+    round. With worker_max_iters=4 the last-round rule cannot fire on round 1,
+    so an escalation here can only have come from the ambiguity flag."""
+    unsure = dict(GRADE_RESOLVED, status="refine", gap="unclear", ambiguous=True)
+    s = Scenario(plan=[PLAN_TWO], grade=[unsure, unsure, GRADE_RESOLVED],
+                 sufficient=[SUFF_YES])
+    install(s)
+    run = await loop.investigate("q", cfg=loop.WaveConfig(worker_max_iters=4))
+    assert run.trajectory[0]["results"][0]["escalated"] is True
+    assert loop.LARGE_MODEL in s.models_for("worker")
+    return "grader ambiguity escalated before the final round"
+
+
+async def case_no_escalation_when_resolved():
+    """A worker that resolves on round 1 must never reach the large model."""
+    s = Scenario(plan=[PLAN_TWO], grade=[GRADE_RESOLVED], sufficient=[SUFF_YES])
+    install(s)
+    run = await loop.investigate("q")
+    assert all(m == loop.SMALL_MODEL for m in s.models_for("worker")), s.models_for("worker")
+    assert not any(r["escalated"] for r in run.trajectory[0]["results"])
+    return "resolved on round 1 stayed on the small model"
 
 
 async def case_fallback():
@@ -313,6 +334,8 @@ async def case_answer_seam():
 CASES = [
     ("happy path", case_happy),
     ("two waves + escalation", case_two_waves),
+    ("escalate on ambiguity", case_escalate_on_ambiguous),
+    ("no escalation when resolved", case_no_escalation_when_resolved),
     ("wave-1 fallback", case_fallback),
     ("stalled", case_stalled),
     ("worker timeout", case_timeout),

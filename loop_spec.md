@@ -119,13 +119,13 @@ Per iteration (max `WORKER_MAX_ITERS`, default 3):
    messages by reading its span, `structured_search` with
    `min_id`/`max_id` set to the cluster's `first_message_id`/
    `last_message_id` (built 2026-08-23; both ends inclusive)
-3. Batch-grade all candidate **messages** for relevance in **one** LLM call
-   (structured output, small model). Grader scores are the run's only
-   relevance scores (§2.4, §5)
+3. Judge all candidate **messages** in **one** LLM call (structured output,
+   small model): which bear on the sub-question, what they establish as facts
+   with message-id citations, and whether the sub-question is now answered
 4. Self-assess: resolved / needs refinement / unresolvable
 5. If refinement: rewrite the calls using graded results, next iteration
 
-Worker output: `{sub_question, status, graded_messages[], extracted_facts[],
+Worker output: `{sub_question, status, extracted_facts[], message_ids_seen[],
 iterations_used, model_escalated}` — facts cite message ids only.
 
 Workers write nothing shared mid-flight; everything merges at the barrier.
@@ -135,8 +135,10 @@ Workers write nothing shared mid-flight; everything merges at the barrier.
 
 Runs at each barrier. Two-stage:
 
-- **Cheap gate first**: all sub-questions status=resolved AND aggregate
-  grader relevance (from §2.3 step 3) above threshold → done, skip the LLM
+- **Cheap gate first**: all sub-questions status=resolved AND at least one
+  produced a fact → done, skip the LLM. No score is involved: the grader's
+  own status is the signal, and a second number from the same call would be
+  the same witness answering twice (§5)
 - **LLM check only when ambiguous**: small model, structured yes/no + gap list
 - Gap list feeds the next planner call directly
 
@@ -165,7 +167,7 @@ WAVE N
 │     worker B: iter 1..k
 │     worker C: iter 1..k
 ├── BARRIER ──────────────────── all workers joined or timed out
-├── merge ────────────────────── facts, graded messages, statuses → ledger
+├── merge ────────────────────── facts, message ids, statuses → ledger
 ├── sufficiency check ────────── cheap gate, LLM only if ambiguous
 └── decision ─────────────────── replan (wave N+1) | terminate → synthesize
 ```
@@ -218,9 +220,8 @@ Locked writes; lock-free reads.
 
 ### 4.2 Retrieved-evidence set
 
-`set[message_id]` of everything retrieved, plus the graded messages with
-their scores. Merged at barriers. Used for cross-wave dedup and final
-re-ranking. Cluster ids already drilled into are tracked alongside, so a
+`set[message_id]` of everything retrieved. Merged at barriers. Used for
+cross-wave dedup. Cluster ids already drilled into are tracked alongside, so a
 later wave doesn't re-read a span — but clusters themselves are pointers,
 not evidence (§1).
 
@@ -266,11 +267,18 @@ them now.
 
 Workers **start small and escalate on evidence**, never on prediction:
 
-- aggregate grader relevance below `ESCALATE_SCORE` after iteration 1
-  (grader scores only — cosine distance ranks cluster hits and gates
-  nothing; most instruments return no score at all), or
-- self-assessed ambiguity in grading output, or
-- contradiction detected against the fact store
+- the grader self-assesses its reading as ambiguous, or
+- the worker is entering its final round still unresolved — the cheap model
+  has had every chance it is going to get
+
+**There is no relevance score anywhere in this system.** The draft gated both
+escalation and the cheap sufficiency gate on a 0.0-1.0 relevance number the
+grader assigned its own rows. That number came from the same call, the same
+model and the same rows as the grader's `status`, so it corroborated nothing —
+a grader inflating one inflates the other — and the thresholds it was compared
+against (0.55, 0.70) were guesses with no corpus to calibrate them. Both gates
+now read the grader's status and ambiguity flag directly. Cosine distance
+still ranks cluster hits and still gates nothing.
 
 Escalation is per-worker, one-way, logged in worker output.
 
@@ -352,7 +360,7 @@ show. The JSONL barrier snapshots below are the eval-mode addition on top.
 **Prerequisite — does not exist yet.** The eval harness and synthetic corpus
 are net-new work (specs.md tags synthetic eval `[later]`; test.py is the
 budget/schedule test). Deterministic mode, threshold tuning
-(`ESCALATE_SCORE`, `DEDUP_SIM`, `CTX_SIM`), and snapshot replay all depend
+(`DEDUP_SIM`, `CTX_SIM`), and snapshot replay all depend
 on it.
 
 `deterministic=True` flag:
@@ -442,14 +450,12 @@ waves:
 workers:
   max_concurrent: 6
   max_iters: 3
-  query_variants: 2
 budgets:
   max_total_llm_calls: 40
   max_total_tokens: null   # run-level override; the $ cap in api_usage is global
 thresholds:
   dedup_sim: 0.90          # placeholder — see caveat below
   ctx_sim: 0.75            # placeholder — see caveat below
-  escalate_score: 0.55     # grader relevance; tune on eval corpus
 models:
   planner: gemini-3.5-flash
   worker: gemini-3.1-flash-lite
@@ -457,7 +463,7 @@ models:
   synthesis: gemini-3.5-flash
 eval:
   deterministic: false
-  snapshot_waves: true
+  snapshot_dir: null       # set WAVE_SNAPSHOT_DIR to turn wave snapshots on
 ```
 
 Threshold caveat: `gemini-embedding-2` prefixes queries and documents

@@ -138,11 +138,12 @@ relevant, what it establishes, and whether the sub-question is answered.
 
 {CORPUS_NOTE}
 
-## Grading
-Score every row you were shown for relevance to THE SUB-QUESTION, 0.0 to 1.0.
-Be honest and be harsh: a row that merely mentions the same person is not
-relevant to a question about what they decided. Relevance scores drive whether
-the loop keeps going, so inflated scores end the search early with nothing.
+## Reading the rows
+Most of what a search returns is not relevant. A row that merely mentions the
+same person is not evidence about what they decided, and a cluster summary that
+sounds close is not evidence at all. Work out which rows actually bear on THE
+SUB-QUESTION, and ignore the rest — you do not report on them, they simply do
+not become facts.
 
 ## Extracting facts
 A FACT is only what a cited message actually establishes.
@@ -181,9 +182,6 @@ next round rather than guessing here.
 Reply with ONLY this JSON object — no markdown fences, no other text:
 
 {{
-  "graded": [
-    {{"message_id": "123456789", "score": 0.0, "why": "one short line"}}
-  ],
   "facts": [
     {{"claim": "...", "citations": {{"<message id>": "<short excerpt>"}}}}
   ],
@@ -197,8 +195,8 @@ Reply with ONLY this JSON object — no markdown fences, no other text:
   "note": "one short line for the log"
 }}
 
-Every key is required except that lists may be empty. Grade only rows you were
-actually shown.
+Every key is required except that lists may be empty. Every citation must be a
+message id you were actually shown.
 """
 
 

@@ -83,14 +83,20 @@ class WaveConfig:
     max_llm_calls: int = int(os.environ.get("WAVE_MAX_LLM_CALLS", "40"))
     max_tokens: Optional[int] = None
 
-    # Thresholds. dedup_sim and ctx_sim compare a query-shaped embedding to
-    # another query-shaped embedding, which is not the pairing
-    # gemini-embedding-2's prefixes were tuned for — treat both as placeholders
-    # until there is an eval corpus to tune them on (loop_spec.md §9).
+    # Thresholds. Both compare a query-shaped embedding to another query-shaped
+    # embedding, which is not the pairing gemini-embedding-2's prefixes were
+    # tuned for — treat them as placeholders until there is an eval corpus to
+    # tune them on (loop_spec.md §9).
+    #
+    # There is no relevance threshold here any more. The grader used to score
+    # every row 0.0-1.0 and two gates compared that score against a number, but
+    # the score came from the same call, the same model, and the same rows as
+    # the grader's own status — so it was one witness answering twice, not
+    # corroboration, and both numbers were guesses nothing had calibrated. The
+    # grader's status and its ambiguity flag say the same thing without the
+    # arithmetic.
     dedup_sim: float = 0.90
     ctx_sim: float = 0.75
-    escalate_score: float = 0.55
-    sufficient_score: float = 0.70
 
     # How much ledger a worker may be shown, and when it is worth paying an
     # embedding call to choose which part. Under this many facts, everything
@@ -295,17 +301,12 @@ class WorkerResult:
     status: str                      # resolved | refine | unresolvable | error | timeout
     facts: list[dict[str, Any]] = field(default_factory=list)
     inferences: list[dict[str, Any]] = field(default_factory=list)
-    graded: list[dict[str, Any]] = field(default_factory=list)
     message_ids: list[str] = field(default_factory=list)
     calls: list[dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     escalated: bool = False
     gap: str = ""
     note: str = ""
-
-    @property
-    def top_score(self) -> float:
-        return max((float(g.get("score") or 0.0) for g in self.graded), default=0.0)
 
 
 @dataclass
@@ -749,29 +750,37 @@ async def _run_worker(
 
         result.facts.extend(graded.get("facts") or [])
         result.inferences.extend(graded.get("inferences") or [])
-        new_graded = [g for g in (graded.get("graded") or []) if isinstance(g, dict)]
-        result.graded.extend(new_graded)
         status = str(graded.get("status") or "refine")
         result.status = status if status in ("resolved", "refine", "unresolvable") else "refine"
         result.gap = str(graded.get("gap") or "")
         result.note = str(graded.get("note") or "")
+        ambiguous = bool(graded.get("ambiguous"))
 
-        log.info("    [w] %s: round %d -> %s (top score %.2f, %d facts)",
-                 sub.text[:40], iteration, result.status, result.top_score,
+        log.info("    [w] %s: round %d -> %s%s (%d facts)",
+                 sub.text[:40], iteration, result.status,
+                 " [ambiguous]" if ambiguous else "",
                  len(graded.get("facts") or []))
 
         if result.status in ("resolved", "unresolvable"):
             break
 
-        # Escalate on evidence, never on prediction: a weak best score after a
-        # real attempt, or a grader that says it cannot tell. One way, and only
-        # once — the second escalation would just be the same model again.
-        if not result.escalated and (
-            result.top_score < cfg.escalate_score or bool(graded.get("ambiguous"))
-        ):
+        # Escalate on evidence, never on prediction. Two triggers, both of them
+        # something that already happened rather than a number about it:
+        #
+        #   - the grader says it cannot tell (ambiguous), or
+        #   - the worker is about to start its last round and still has not
+        #     resolved this, so the cheap model has had every chance it is
+        #     going to get.
+        #
+        # The last-round rule is what bounds the cost: rounds before it stay on
+        # the small model, and only the final attempt is expensive. One way,
+        # and only once — a second escalation would be the same model again.
+        last_round = iteration >= cfg.worker_max_iters - 1
+        if not result.escalated and (ambiguous or last_round):
             model = LARGE_MODEL
             result.escalated = True
-            log.info("    [w] %s: escalating to %s", sub.text[:40], LARGE_MODEL)
+            log.info("    [w] %s: escalating to %s (%s)", sub.text[:40], LARGE_MODEL,
+                     "grader was unsure" if ambiguous else "final round")
 
         found = "; ".join(f"{f.get('claim')}" for f in (graded.get("facts") or [])[:5])
         history.append(
@@ -881,12 +890,16 @@ async def _sufficient(
     budget: Budget,
 ) -> tuple[str, list[str], str]:
     """(verdict, gaps, note). Verdict is yes | no | unanswerable."""
+    # The cheap gate: if every sub-question came back resolved and produced
+    # something, the run is done and no model needs to be asked. It used to
+    # also require an average relevance score to clear a threshold, but that
+    # score came from the same grader call that said "resolved" — a second
+    # opinion from the same witness, which is not a check. The facts requirement
+    # is a real one: a worker can call itself resolved having established
+    # nothing, and that is the case worth catching.
     if results and all(r.status == "resolved" for r in results):
-        scores = [r.top_score for r in results]
-        aggregate = sum(scores) / len(scores)
-        if aggregate >= cfg.sufficient_score:
-            return "yes", [], (f"cheap gate: every sub-question resolved, "
-                               f"aggregate relevance {aggregate:.2f}")
+        if any(r.facts for r in results):
+            return "yes", [], "cheap gate: every sub-question resolved"
 
     if budget.exhausted:
         return "no", [], "budget exhausted before the sufficiency check"
@@ -1025,7 +1038,7 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
             "results": [
                 {"sub_question": r.sub_question, "status": r.status,
                  "iterations": r.iterations, "escalated": r.escalated,
-                 "top_score": round(r.top_score, 3), "facts": len(r.facts),
+                 "facts": len(r.facts), "messages_seen": len(r.message_ids),
                  "calls": r.calls, "gap": r.gap, "note": r.note}
                 for r in results
             ],
