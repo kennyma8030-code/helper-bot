@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 from typing import Any, Optional, Sequence
 
 from dotenv import load_dotenv
+from pgvector import Vector
 from pgvector.psycopg import register_vector_async
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
@@ -1076,13 +1077,19 @@ async def unembedded_clusters(limit: int = 64) -> list[dict[str, Any]]:
 async def set_cluster_embedding(
     cluster_id: int, embedding: Sequence[float], embed_model: str
 ) -> None:
-    """Attach one cluster's vector, recording what produced it."""
+    """Attach one cluster's vector, recording what produced it.
+
+    Vector() for the same reason similarity_search uses it: a bare list arrives
+    as double precision[]. Here the assignment cast into the vector column
+    rescues it, so this worked either way — which is precisely what let the
+    read path stay broken unnoticed. Both sides send the same type now.
+    """
     pool = _get_pool()
     async with pool.connection() as conn:
         await conn.execute(
             "UPDATE clusters SET embedding = %s, embed_model = %s, "
             "embedded_at = now() WHERE id = %s",
-            (embedding, embed_model, cluster_id),
+            (Vector(embedding), embed_model, cluster_id),
         )
 
 
@@ -1131,10 +1138,18 @@ async def similarity_search(
       ORDER BY embedding {DISTANCE_OP} %s
          LIMIT %s
     """
+    # Vector(), not the bare list. register_vector_async teaches psycopg to
+    # send a pgvector Vector as `vector`; a plain Python list falls through to
+    # the default dumper and arrives as `double precision[]`. Writing one of
+    # those into a vector column works — pgvector defines an assignment cast —
+    # so the embed pass never noticed, but `<=>` is an operator and operators
+    # take no implicit cast: it fails with "operator does not exist: vector <=>
+    # double precision[]". Reads and writes have to agree, so both wrap.
+    query = Vector(embedding)
     pool = _get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(
-            sql, [embedding, *filter_params, embedding, limit]
+            sql, [query, *filter_params, query, limit]
         )
         return await cur.fetchall()
 
