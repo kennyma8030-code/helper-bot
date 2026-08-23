@@ -880,7 +880,7 @@ def _merge(ledger: Ledger, results: list[WorkerResult]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Sufficiency — cheap gate first, model only when it is a real question
+# Sufficiency — the original question, read against the whole ledger
 # ---------------------------------------------------------------------------
 
 async def _sufficient(
@@ -889,18 +889,22 @@ async def _sufficient(
     cfg: WaveConfig,
     budget: Budget,
 ) -> tuple[str, list[str], str]:
-    """(verdict, gaps, note). Verdict is yes | no | unanswerable."""
-    # The cheap gate: if every sub-question came back resolved and produced
-    # something, the run is done and no model needs to be asked. It used to
-    # also require an average relevance score to clear a threshold, but that
-    # score came from the same grader call that said "resolved" — a second
-    # opinion from the same witness, which is not a check. The facts requirement
-    # is a real one: a worker can call itself resolved having established
-    # nothing, and that is the case worth catching.
-    if results and all(r.status == "resolved" for r in results):
-        if any(r.facts for r in results):
-            return "yes", [], "cheap gate: every sub-question resolved"
+    """(verdict, gaps, note). Verdict is yes | no | unanswerable.
 
+    This is the only place the ORIGINAL question is read against the whole
+    ledger. Every worker sees one sub-question and nothing else, so all of them
+    can succeed while the question stays unanswered — the answer often lives in
+    how the parts compose, and no worker is in a position to look at that. It
+    is also where the gaps that aim the next wave come from, and the only thing
+    that can call the whole run unanswerable.
+
+    There was a "cheap gate" here that returned yes without asking the model
+    whenever every sub-question came back resolved. It fired in exactly the
+    case the check exists for: workers all reporting success is when a bad
+    decomposition is invisible, because nothing has compared what they found
+    against what was asked. It saved one small-model call per wave and skipped
+    the loop's only end-to-end verification to do it.
+    """
     if budget.exhausted:
         return "no", [], "budget exhausted before the sufficiency check"
 

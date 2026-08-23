@@ -133,14 +133,22 @@ Workers write nothing shared mid-flight; everything merges at the barrier.
 
 ### 2.4 Sufficiency checker
 
-Runs at each barrier. Two-stage:
+Runs at each barrier, every time. One small-model call, structured output:
+yes / no / unanswerable plus a gap list.
 
-- **Cheap gate first**: all sub-questions status=resolved AND at least one
-  produced a fact → done, skip the LLM. No score is involved: the grader's
-  own status is the signal, and a second number from the same call would be
-  the same witness answering twice (§5)
-- **LLM check only when ambiguous**: small model, structured yes/no + gap list
-- Gap list feeds the next planner call directly
+This is the **only place the original question is read against the whole
+ledger**. Every worker sees one sub-question and nothing else, so all of them
+can succeed while the question stays unanswered — the answer often lives in how
+the parts compose, and no worker is positioned to see that. It is also where
+the gaps that aim the next wave come from, and the only thing that can call a
+whole run unanswerable.
+
+The draft had a **cheap gate** in front of it: every sub-question resolved →
+return yes without asking the model. Removed. It fired in exactly the case the
+check exists for — workers all reporting success is precisely when a bad
+decomposition is invisible, because nothing has yet compared what they found
+against what was asked. It saved one small-model call per wave and skipped the
+loop's only end-to-end verification to do it.
 
 ### 2.5 Synthesizer
 
@@ -168,7 +176,7 @@ WAVE N
 │     worker C: iter 1..k
 ├── BARRIER ──────────────────── all workers joined or timed out
 ├── merge ────────────────────── facts, message ids, statuses → ledger
-├── sufficiency check ────────── cheap gate, LLM only if ambiguous
+├── sufficiency check ────────── small model, original question vs. ledger
 └── decision ─────────────────── replan (wave N+1) | terminate → synthesize
 ```
 

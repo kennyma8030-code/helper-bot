@@ -181,8 +181,11 @@ async def case_happy():
     assert len(run.ledger.facts) == 2 and run.ledger.facts[0]["id"] == "F1"
     assert run.ledger.message_ids == {"1401", "1402"}, run.ledger.message_ids
     assert (s.count("planner"), s.count("worker"), s.count("grader")) == (1, 2, 2)
-    assert s.count("sufficiency") == 0, "cheap gate should have skipped the model"
-    assert run.llm_calls == 5, run.llm_calls
+    # Sufficiency always runs: it is the only check that reads the original
+    # question against the whole ledger, and workers all reporting resolved is
+    # exactly when a bad decomposition would otherwise go unnoticed.
+    assert s.count("sufficiency") == 1, s.calls
+    assert run.llm_calls == 6, run.llm_calls
     return f"verdict={run.verdict} waves={run.waves} facts={len(run.ledger.facts)} calls={run.llm_calls}"
 
 
