@@ -36,7 +36,7 @@ import llm
 # answer nobody would think to look for.
 from db import CORPUS_TZ
 from llm import ask_gemini
-from loop import MODEL, _extract_json
+from llm import LARGE_MODEL as MODEL, extract_json as _extract_json
 from prompts import SUMMARY_PROMPT, SUMMARY_PROMPT_VERSION
 
 log = logging.getLogger(__name__)

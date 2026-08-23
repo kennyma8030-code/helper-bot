@@ -14,6 +14,15 @@ a reduced form, `[later]` deferred until trajectory logs justify it.
 
 # Part 1 — Core Loop, v1 Design
 
+> **Superseded 2026-08-23 by loop_spec.md.** The single budgeted loop below
+> was replaced by the wave loop: a planner splits the question into
+> sub-questions, workers retrieve for one each in parallel, and a barrier
+> merges them before deciding whether to run another wave. The decisions in
+> this section did not all die with it — decisions 1, 2, 3, 4, 5 and 7 are
+> still load-bearing and the wave design reuses them verbatim; decision 6
+> (triage) is struck below. Read this part for *why* the rules are what they
+> are, and loop_spec.md for what runs.
+
 Single-loop, LLM-directed retrieval. One model, called repeatedly with
 role-scoped prompts; no multi-agent machinery until logs prove it is needed.
 

@@ -1,8 +1,30 @@
 # Wave-Style Retrieval Orchestration — Design Spec
 
-Status: draft v2 — v1 reconciled against specs.md and the live schema, 2026-08-18
+Status: **implemented** 2026-08-23 (`loop.py`, `retrieval.py`, `prompts.py`).
+v2 reconciled the draft against specs.md and the live schema on 2026-08-18.
 Scope: multi-branch RAG retrieval loop over group-chat corpus, restructured from
 recursive branch spawning into synchronized waves.
+
+## Where each piece lives
+
+| Spec | Code |
+|---|---|
+| Orchestrator (§2.1, §3) | `loop.investigate` |
+| Planner (§2.2) | `loop._plan`, `prompts.PLANNER_PROMPT` |
+| Sub-question dedup (§2.1) | `loop._dedup` |
+| Worker (§2.3) | `loop._run_worker`, `prompts.WORKER_PROMPT` |
+| Grading (§2.3 step 3) | inside `_run_worker`, `prompts.GRADER_PROMPT` |
+| Barrier + merge (§3) | `loop._dispatch`, `loop._merge` |
+| Sufficiency (§2.4) | `loop._sufficient`, `prompts.SUFFICIENCY_PROMPT` |
+| Synthesis (§2.5) | `loop.synthesize`, `prompts.SYNTH_PROMPT` |
+| Ledger (§4) | `loop.Ledger` |
+| Budgets and knobs (§6, §12) | `loop.Budget`, `loop.WaveConfig` |
+| Instruments | `retrieval.TOOLS`, `retrieval.execute_call` |
+
+Deliberate deviations from the draft, each argued at its own section below:
+`WORKER_TIMEOUT` is 90s rather than 30s (§6), there is no mechanical
+contradiction detector (§4.1), config is a dataclass rather than a YAML file
+(§12), and wave snapshots stay off unless a directory is named (§9).
 
 ---
 
@@ -151,9 +173,15 @@ WAVE N
 Default limits: `MAX_WAVES = 3`. Empirically, if two informed waves haven't
 resolved it, a third rarely does — wave 3 exists for the tail.
 
-Worker timeout: workers that exceed `WORKER_TIMEOUT` (default 30s) are
+Worker timeout: workers that exceed `WORKER_TIMEOUT` (default 90s) are
 cancelled at the barrier; their sub-question is marked unresolved and returns
 to the planner as a gap. A slow worker must never stall the wave indefinitely.
+
+The 90s is a correction to the draft's 30s. A worker runs up to
+`WORKER_MAX_ITERS` rounds, and each round is two sequential model calls (choose
+instruments, then grade) plus the searches between them. At 30s a worker that
+actually used its rounds would be cancelled every time, which makes the timeout
+the normal exit rather than the safety net.
 
 ---
 
@@ -173,11 +201,18 @@ code each merge:
 - `inference` — claim + supporting fact ids + competing explanations
 - `open_question`, `dead_branch`
 
-A new fact that contradicts an existing one is **appended and the conflict
-flagged**, never merged or replaced — conflicts are signal for the merge and
-the synthesizer. Temporal precedence (later statements supersede, per
+A new fact that contradicts an existing one is **appended alongside it**,
+never merged or replaced — the disagreement is left standing, because a
+conflict is signal. Temporal precedence (later statements supersede, per
 speaker) is applied at synthesis time, not by mutating the store. Draft v1's
 `(entity, predicate)` replace-on-write fact store is dropped.
+
+There is deliberately **no mechanical contradiction detector**. Deciding
+whether two English claims conflict is a reading task, not a comparison of
+keys, and the only version of that check worth having is a model doing it with
+both claims and their citations in front of it — which is what synthesis
+already is. Code that flagged conflicts by matching entities would fire on
+paraphrases and miss real ones.
 
 Locked writes; lock-free reads.
 
@@ -252,7 +287,7 @@ Enforced by the orchestrator at dispatch time. All counters in control state.
 | `MAX_TOTAL_LLM_CALLS` | 40 | terminate |
 | `MAX_TOTAL_TOKENS` | run-configurable | terminate |
 | `WORKER_MAX_ITERS` | 3 | worker returns unresolved |
-| `WORKER_TIMEOUT` | 30s | cancel at barrier |
+| `WORKER_TIMEOUT` | 90s | cancel at barrier |
 
 Two budget systems, deliberately: the counters above govern **a single
 run**; the **dollar budget** in `api_usage` (fed by `llm.track_usage`, the
@@ -393,10 +428,17 @@ re-run from that point with modified config.
 
 ## 12. Config reference
 
+Implemented as `loop.WaveConfig`, a dataclass with these defaults, overridable
+per call — and for the two knobs an operator needs at 3am without a deploy
+(`WAVE_MAX_WAVES`, `WAVE_MAX_LLM_CALLS`), by environment variable. Not a YAML
+file: that would be a dependency and a second place for the truth to live. The
+"one knob philosophy" it exists for is intact — cheap and thorough are the same
+code with different numbers.
+
 ```yaml
 waves:
   max_waves: 3
-  worker_timeout_s: 30
+  worker_timeout_s: 90
 workers:
   max_concurrent: 6
   max_iters: 3

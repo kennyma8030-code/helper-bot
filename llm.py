@@ -5,6 +5,7 @@ client so there is a single place for API-key handling, model defaults, and
 call logging.
 """
 
+import json
 import logging
 import math
 import os
@@ -22,6 +23,17 @@ log = logging.getLogger(__name__)
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
+
+# The two tiers every caller picks between. Named by what they are for rather
+# than by model id, so swapping a model is one edit here instead of a grep
+# across the loop, the summarizer, and whatever comes next.
+#
+# LARGE is for work that gates everything downstream — planning a retrieval,
+# writing the answer a human reads, summarizing a day into the retrieval index.
+# SMALL is for the work that runs many times over inside those, and escalates
+# to LARGE only on evidence that it is stuck.
+LARGE_MODEL = "gemini-3.5-flash"
+SMALL_MODEL = "gemini-3.1-flash-lite"
 
 # The one embedding model, pinned. db.EMBED_DIM is the width this model is
 # asked for; changing either means re-embedding every stored cluster vector,
@@ -99,6 +111,27 @@ async def track_usage(model: str, response) -> None:
         )
     except Exception as e:
         log.warning("could not record api usage (%s: %s)", type(e).__name__, e)
+
+
+def extract_json(text: str) -> dict | None:
+    """First parseable JSON object anywhere in a model's reply, or None.
+
+    Fence-tolerant, and tolerant of a model that introduces its JSON with a
+    sentence. Asking for response_mime_type="application/json" makes this
+    trivial where it is available, but not every call can set it — a call with
+    tools attached cannot — and a reply cut short by a token limit is still
+    possible on any of them.
+    """
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == "{":
+            try:
+                obj, _ = decoder.raw_decode(text[i:])
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return None
 
 
 def _normalize(vector: list[float]) -> list[float]:
