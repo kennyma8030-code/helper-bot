@@ -166,7 +166,7 @@ CREATE INDEX IF NOT EXISTS clusters_span_idx
 -- The embed pass walks exactly this: everything not yet embedded, in order.
 CREATE INDEX IF NOT EXISTS clusters_pending_idx
     ON clusters (id) WHERE embedding IS NULL;
--- For the future cluster-similarity read path (not exposed to the planner yet).
+-- Answers the ORDER BY in similarity_search(), the planner's semantic path.
 CREATE INDEX IF NOT EXISTS clusters_embedding_idx
     ON clusters USING hnsw (embedding vector_cosine_ops);
 
@@ -599,8 +599,9 @@ _EQ_FIELDS = {
 def _build_where(filters: Optional[dict[str, Any]]) -> tuple[str, list[Any]]:
     """Turn a filter dict into a WHERE fragment + ordered params.
 
-    Supported keys: the equality fields in _EQ_FIELDS, plus range keys
-    'after' / 'before' (created_at bounds). Returns ("", []) when empty.
+    Supported keys: the equality fields in _EQ_FIELDS, plus two range pairs —
+    'after' / 'before' (created_at bounds) and 'min_id' / 'max_id'
+    (discord_message_id bounds). Returns ("", []) when empty.
     """
     if not filters:
         return "", []
@@ -619,6 +620,21 @@ def _build_where(filters: Optional[dict[str, Any]]) -> tuple[str, list[Any]]:
     if filters.get("before") is not None:
         clauses.append("created_at < %s")
         params.append(_as_utc(filters["before"]))
+
+    # Id bounds, and both ends are inclusive — unlike the timestamp pair above,
+    # whose `before` is exclusive so consecutive day windows can abut without
+    # double-counting a message. The id range exists to read a cluster's span
+    # back out, and clusters store first_message_id/last_message_id as the
+    # first and last messages actually in the span, so excluding either end
+    # would drop a real message. discord_message_id, not the bigserial `id`:
+    # the discord id is what clusters, citations, and replies all point with,
+    # and its UNIQUE constraint indexes these range scans already.
+    if filters.get("min_id") is not None:
+        clauses.append("discord_message_id >= %s")
+        params.append(filters["min_id"])
+    if filters.get("max_id") is not None:
+        clauses.append("discord_message_id <= %s")
+        params.append(filters["max_id"])
 
     if not clauses:
         return "", []
@@ -738,6 +754,59 @@ async def message_counts_by_author(
     pool = _get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(sql, params)
+        return await cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Retrieval instrument 5: aggregation (counts, never bodies)
+# ---------------------------------------------------------------------------
+
+async def activity_stats(
+    *,
+    group_by: str = "author_id",
+    filters: Optional[dict[str, Any]] = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Message counts bucketed by one dimension, largest bucket first.
+
+    Answers "who talks most", "when is this channel awake", "how big was March"
+    without reading a single message body, so it costs one query and adds no
+    rows to the model's context. The counting questions that would otherwise
+    burn the retrieval budget paging through messages land here instead.
+
+    group_by is a fixed whitelist because it is interpolated into the SQL.
+    Every option is index-backed: author_id/channel_id have their own B-trees,
+    day_of_week+hour_of_day share messages_dow_hour_idx, and the date buckets
+    scan messages_created_at_idx.
+    """
+    buckets = {
+        "author_id": "author_id",
+        "channel_id": "channel_id",
+        "day_of_week": "day_of_week",
+        "hour_of_day": "hour_of_day",
+        "day": "(created_at AT TIME ZONE %s)::date",
+        "month": "date_trunc('month', created_at AT TIME ZONE %s)::date",
+    }
+    if group_by not in buckets:
+        raise ValueError(f"group_by must be one of {sorted(buckets)}")
+    expr = buckets[group_by]
+
+    # The bucket expression sits in the SELECT list, ahead of the WHERE params.
+    # GROUP BY 1 rather than repeating it keeps that ordering to one binding.
+    params: list[Any] = [str(CORPUS_TZ)] if "%s" in expr else []
+    where, where_params = _build_where(filters)
+    params.extend(where_params)
+
+    sql = f"""
+        SELECT {expr} AS bucket, COUNT(*) AS total
+          FROM messages {where}
+      GROUP BY 1
+      ORDER BY total DESC
+         LIMIT %s
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(sql, [*params, limit])
         return await cur.fetchall()
 
 
@@ -1015,6 +1084,59 @@ async def set_cluster_embedding(
             "embedded_at = now() WHERE id = %s",
             (embedding, embed_model, cluster_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Retrieval instrument 6: cluster similarity (semantic, and only an index)
+# ---------------------------------------------------------------------------
+# A hit here is a span worth reading, not a fact. Clusters carry LLM-written
+# summaries, so citing one would cite something no human ever said — the caller
+# drills into first_message_id..last_message_id and cites the messages it finds
+# (specs-summaries.md decision 2, enforced by the ledger's id check).
+
+async def similarity_search(
+    embedding: Sequence[float],
+    *,
+    channel_id: Optional[int] = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Clusters whose summary vector is nearest the query vector, closest first.
+
+    Cosine distance over clusters_embedding_idx. The vector never comes from
+    here: db.py has no model client (llm.py imports db, not the reverse), so
+    the caller embeds the query — with is_query=True, since a query embedded as
+    a document is compared against the wrong shape.
+
+    Unembedded clusters are excluded rather than sorted last: a NULL vector has
+    no distance, and letting it through would hand back rows that matched
+    nothing. The `embedding IS NOT NULL` predicate also keeps this off any
+    cluster the embed pass has not reached yet.
+    """
+    clauses = ["embedding IS NOT NULL"]
+    filter_params: list[Any] = []
+    if channel_id is not None:
+        clauses.append("channel_id = %s")
+        filter_params.append(channel_id)
+    where = "WHERE " + " AND ".join(clauses)
+
+    # The query vector binds twice — once for the returned distance, once for
+    # the ORDER BY that the HNSW index actually answers.
+    sql = f"""
+        SELECT id, channel_id, topic, summary,
+               first_message_id, last_message_id,
+               started_at, ended_at, message_count,
+               embedding {DISTANCE_OP} %s AS distance
+          FROM clusters
+          {where}
+      ORDER BY embedding {DISTANCE_OP} %s
+         LIMIT %s
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            sql, [embedding, *filter_params, embedding, limit]
+        )
+        return await cur.fetchall()
 
 
 # ---------------------------------------------------------------------------

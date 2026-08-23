@@ -17,7 +17,7 @@ from typing import Any
 from google.genai import types
 
 import db
-from llm import ask_gemini, client, track_usage
+from llm import ask_gemini, client, embed_texts, track_usage
 from prompts import PLANNER_PROMPT, SYNTH_PROMPT
 
 log = logging.getLogger(__name__)
@@ -55,6 +55,8 @@ _FILTER_PROPS: dict[str, types.Schema] = {
     "hour_of_day": _s("INTEGER", "Hour of day, 0..23 (UTC)"),
     "after": _s("STRING", "Only messages at/after this ISO datetime, e.g. 2026-03-01T00:00:00"),
     "before": _s("STRING", "Only messages before this ISO datetime (exclusive)"),
+    "min_id": _s("INTEGER", "Only messages with this discord message id or higher (inclusive)"),
+    "max_id": _s("INTEGER", "Only messages with this discord message id or lower (inclusive)"),
 }
 _FILTER_KEYS = set(_FILTER_PROPS)
 
@@ -107,6 +109,38 @@ TOOLS = types.Tool(function_declarations=[
             "limit": _LIMIT,
         }, required=["anchor"]),
     ),
+    types.FunctionDeclaration(
+        name="activity_stats",
+        description=(
+            "Counts only — messages per author, channel, weekday, hour, day, or "
+            "month. Answer 'who most', 'when', and 'how often' with this rather "
+            "than paging through messages; it returns totals, never text."
+        ),
+        parameters=_obj({
+            "group_by": _s("STRING", "One of: 'author_id' (default), 'channel_id', "
+                                     "'day_of_week', 'hour_of_day', 'day', 'month'"),
+            **_FILTER_PROPS,
+            "limit": _LIMIT,
+        }),
+    ),
+    types.FunctionDeclaration(
+        name="similarity_search",
+        description=(
+            "Semantic search over conversation summaries — finds discussions by "
+            "meaning when you do not know the words they used. The most "
+            "expensive instrument: try structured_search and keyword_search "
+            "first. Returns spans to read, not quotable text: a hit is a "
+            "summary someone wrote about the conversation, never a quote from "
+            "it. Read the real messages behind a hit with structured_search, "
+            "passing min_id=first_message_id and max_id=last_message_id, and "
+            "cite those."
+        ),
+        parameters=_obj({
+            "query": _s("STRING", "What to look for, in natural language"),
+            "channel_id": _s("INTEGER", "Optionally restrict to one channel"),
+            "limit": _LIMIT,
+        }, required=["query"]),
+    ),
 ])
 
 
@@ -128,6 +162,14 @@ def _split_args(args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     for key in ("after", "before"):
         if key in filters:
             filters[key] = datetime.fromisoformat(str(filters[key]))
+    # Discord ids are past 2^53, where JSON numbers stop being exact. If one
+    # arrives as a float it has already lost its low bits and would name a
+    # message that does not exist, so int() here is a normalizer, not a fix —
+    # what it reliably rescues is the id that arrives as a string.
+    for key in ("min_id", "max_id"):
+        if key in filters:
+            filters[key] = int(float(filters[key]) if isinstance(filters[key], float)
+                               else filters[key])
     return filters, rest
 
 
@@ -165,6 +207,21 @@ async def _execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]
         rows = await db.messages_near(
             datetime.fromisoformat(str(rest["anchor"])),
             window_minutes=int(rest.get("window_minutes", 30)),
+            channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
+            limit=limit,
+        )
+    elif name == "activity_stats":
+        rows = await db.activity_stats(
+            group_by=str(rest.get("group_by", "author_id")),
+            filters=filters or None,
+            limit=limit,
+        )
+    elif name == "similarity_search":
+        # is_query: the stored side embedded summaries as documents, and the two
+        # sides are not interchangeable for this model.
+        vectors = await embed_texts([str(rest["query"])], is_query=True)
+        rows = await db.similarity_search(
+            vectors[0],
             channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
             limit=limit,
         )
