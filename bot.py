@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -13,6 +15,32 @@ import qa
 import summarize
 
 load_dotenv()
+
+
+# Logging has to be configured here, in the entry point, or none of it is
+# visible. db, llm, loop, retrieval and summarize all log through the logging
+# module, but a logger with no handler anywhere falls back to Python's handler
+# of last resort — which is stderr at WARNING. Every log.info in the wave loop
+# (the sub-questions, the instrument calls, the ledger after each wave) was
+# being dropped on the floor, and only the warnings got out. That is why a
+# failed search was visible and the wave that ran it was not.
+#
+# stdout, not stderr, because Railway captures both but interleaves stdout with
+# the print() calls this file already makes.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)-7s %(name)-9s %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+# The libraries are not on INFO with us. discord.py narrates every gateway
+# event, and google-genai and httpx log a line per HTTP request — at INFO they
+# bury the thing you turned INFO on to read.
+for noisy in ("discord", "httpx", "httpcore", "google_genai", "urllib3", "psycopg"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # message_content and members are privileged intents — enable them in the
 # Discord Developer Portal (Bot > Privileged Gateway Intents) as well.

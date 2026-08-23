@@ -394,6 +394,7 @@ async def _call_model(
     model: str,
     contents: str,
     budget: Budget,
+    label: str = "call",
     system: Optional[str] = None,
     tools: bool = False,
     cache_name: Optional[str] = None,
@@ -446,6 +447,19 @@ async def _call_model(
 
     budget.record(response)
     await track_usage(model, response)
+
+    # One line per model call, so a wave's cost is readable as it happens rather
+    # than reconstructed from the running total afterwards. `cached` is the part
+    # of the input the server billed at the cache rate — it is what tells you
+    # whether the worker cache actually engaged, which nothing else reveals.
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
+    total_tokens = getattr(usage, "total_token_count", 0) or 0 if usage else 0
+    cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0 if usage else 0
+    log.info("    call %-11s %-22s in=%-6d out=%-5d%s  [%d/%d calls]",
+             label, model, prompt_tokens, max(total_tokens - prompt_tokens, 0),
+             f" cached={cached_tokens}" if cached_tokens else "",
+             budget.llm_calls, budget.max_llm_calls)
     return response
 
 
@@ -506,6 +520,7 @@ async def _plan(
         model=LARGE_MODEL,
         contents="\n\n".join(parts),
         budget=budget,
+        label="planner",
         system=PLANNER_PROMPT,
         json_out=True,
         deterministic=cfg.deterministic,
@@ -673,6 +688,7 @@ async def _run_worker(
             model=model,
             contents="\n\n".join(parts),
             budget=budget,
+            label="worker",
             system=WORKER_PROMPT,
             tools=True,
             cache_name=cache_name,
@@ -718,6 +734,7 @@ async def _run_worker(
                 f"SEARCH RESULTS TO JUDGE:\n{rendered}"
             ),
             budget=budget,
+            label="grader",
             system=GRADER_PROMPT,
             json_out=True,
             deterministic=cfg.deterministic,
@@ -888,6 +905,7 @@ async def _sufficient(
             f"SUB-QUESTION STATUS THIS WAVE:\n{statuses}"
         ),
         budget=budget,
+        label="sufficiency",
         system=SUFFICIENCY_PROMPT,
         json_out=True,
         deterministic=cfg.deterministic,

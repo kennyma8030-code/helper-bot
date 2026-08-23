@@ -100,12 +100,16 @@ class Scenario:
         self._i[key] += 1
         return payload
 
-    async def call_model(self, *, model, contents, budget, system=None, tools=False,
-                         cache_name=None, json_out=False, deterministic=False):
+    async def call_model(self, *, model, contents, budget, label="call", system=None,
+                         tools=False, cache_name=None, json_out=False,
+                         deterministic=False):
+        # Role is derived from the prompt object, not the label, so a call site
+        # that gets relabelled but sends the wrong prompt still fails here.
         role = ("worker" if tools else
                 "planner" if system is PLANNER_PROMPT else
                 "grader" if system is GRADER_PROMPT else
                 "sufficiency" if system is SUFFICIENCY_PROMPT else "unknown")
+        assert label in (role, "call"), f"call labelled {label!r} sent the {role} prompt"
         self.calls.append((role, model))
 
         if role == "worker":
