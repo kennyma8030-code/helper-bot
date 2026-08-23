@@ -78,9 +78,17 @@ synthesize from ledger only → answer (or explicit insufficiency)
    Decisions stay centralized (one planner, one ledger writer); only
    execution is parallel.
 
-6. **Triage before the loop.** First call classifies: one-lookup question vs
+6. ~~**Triage before the loop.** First call classifies: one-lookup question vs
    investigation. Simple lookups skip loop machinery entirely (routing
-   discipline — don't escalate simple questions into agentic search).
+   discipline — don't escalate simple questions into agentic search).~~
+   **Superseded 2026-08-18 by loop_spec.md §1.** Simple lookup is not this
+   application's job — Discord's own search already answers "find the message
+   where someone said X", so a lookup tier optimizes a path the bot should
+   not be on. The bot exists for multi-step reasoning over the history, and
+   every question enters the loop. What triage was protecting against —
+   burning agentic budget on a light question — is handled by the wave
+   design's cheap paths instead: the wave-1 "no sub-questions → direct
+   retrieval" fallback, and the 1-wave configuration.
 
 7. **Every pass is logged.** Retrieval specs issued, ledger diffs,
    sufficiency verdicts, budget spent. This is the debugging tool, the eval
@@ -170,9 +178,11 @@ can confirm. Design constraints when built:
 
 ## Core architecture
 
-- `[v1-lite]` Tiered retrieval (simple lookup / multi-hop / aggregation /
-  no-answer) — v1 has two tiers (lookup vs investigation); finer tiers later
-- `[v1]` Query router — classify question type before retrieving (= triage)
+- ~~`[v1-lite]` Tiered retrieval (simple lookup / multi-hop / aggregation /
+  no-answer)~~ **Dropped 2026-08-18** with the triage decision above: there
+  is no lookup tier, because lookup is not this bot's job
+- ~~`[v1]` Query router — classify question type before retrieving
+  (= triage)~~ **Dropped 2026-08-18**, same reason — see decision 6
 - `[v1]` LLM-directed retrieval: planner authors queries; the question
   itself may never be embedded
 - `[v1-lite]` Backward-chaining / dependency-discovery retrieval — falls out
