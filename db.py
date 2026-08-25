@@ -27,6 +27,7 @@ back them.
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Optional, Sequence
@@ -115,6 +116,16 @@ DROP INDEX IF EXISTS messages_author_cat_idx;
 ALTER TABLE messages DROP COLUMN IF EXISTS category;
 ALTER TABLE messages DROP COLUMN IF EXISTS sentiment;
 ALTER TABLE messages DROP COLUMN IF EXISTS target_person_id;
+
+-- The server a message came from. Added 2026-08-25 with multi-server support.
+-- Nullable, and deliberately not the fence: channel_id already partitions the
+-- corpus correctly, since discord ids are globally unique snowflakes, and rows
+-- written before this column existed have no guild until the repair walk
+-- backfills them. Making reads depend on it would have hidden the whole
+-- existing corpus the moment it shipped. What it buys is grouping — every
+-- channel of one server — plus per-server settings and spend later.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS guild_id bigint;
+CREATE INDEX IF NOT EXISTS messages_guild_idx         ON messages (guild_id);
 
 -- Selective equality filters (per-person, per-channel) hit these B-tree
 -- indexes directly.
@@ -479,6 +490,7 @@ async def upsert_message(
     content: str,
     created_at: datetime,
     reply_to_message_id: Optional[int] = None,
+    guild_id: Optional[int] = None,
 ) -> tuple[int, bool]:
     """Insert a message (or update it if already ingested).
 
@@ -502,20 +514,24 @@ async def upsert_message(
     day_of_week = local.weekday()               # 0=Monday
     hour_of_day = local.hour
 
+    # COALESCE on guild_id, not EXCLUDED: the repair walk re-upserts rows that
+    # already exist, and a walk that could not resolve the guild would otherwise
+    # blank one that had already been filled in. Backfill only ever adds.
     sql = """
         INSERT INTO messages (
             discord_message_id, channel_id, author_id, content, created_at,
-            reply_to_message_id, day_of_week, hour_of_day
+            reply_to_message_id, day_of_week, hour_of_day, guild_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (discord_message_id) DO UPDATE SET
             content             = EXCLUDED.content,
-            reply_to_message_id = EXCLUDED.reply_to_message_id
+            reply_to_message_id = EXCLUDED.reply_to_message_id,
+            guild_id            = COALESCE(EXCLUDED.guild_id, messages.guild_id)
         RETURNING id, (xmax = 0) AS inserted
     """
     params = (
         discord_message_id, channel_id, author_id, content, created_at,
-        reply_to_message_id, day_of_week, hour_of_day,
+        reply_to_message_id, day_of_week, hour_of_day, guild_id,
     )
     pool = _get_pool()
     async with pool.connection() as conn:
@@ -524,15 +540,25 @@ async def upsert_message(
     return row["id"], row["inserted"]
 
 
-async def known_channel_ids() -> list[int]:
+async def known_channel_ids(guild_id: Optional[int] = None) -> list[int]:
     """Every channel the store already holds messages for.
 
     This is what the startup catch-up walks: a channel enters the corpus by
     being backfilled once, deliberately, and is kept current from then on.
+
+    With `guild_id`, only that server's channels — which is one half of
+    building a Scope. It reads what is stored rather than what Discord
+    currently reports, so a channel the bot has lost access to still fences
+    correctly instead of silently dropping out of scope.
     """
+    sql = "SELECT DISTINCT channel_id FROM messages"
+    params: list[Any] = []
+    if guild_id is not None:
+        sql += " WHERE guild_id = %s"
+        params.append(guild_id)
     pool = _get_pool()
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT DISTINCT channel_id FROM messages")
+        cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
     return [row["channel_id"] for row in rows]
 
@@ -597,18 +623,94 @@ _EQ_FIELDS = {
 }
 
 
-def _build_where(filters: Optional[dict[str, Any]]) -> tuple[str, list[Any]]:
-    """Turn a filter dict into a WHERE fragment + ordered params.
+@dataclass(frozen=True)
+class Scope:
+    """The channels one request is allowed to touch. Not a filter — a fence.
+
+    Every filter on a retrieval instrument is optional and chosen by the model,
+    which is fine while the bot sits in one server: the worst a missing
+    channel_id costs is a wider search. With the bot in two servers it costs
+    something else entirely — a question asked in one group answered out of
+    another group's private history. A model omitting an argument is ordinary
+    model behaviour, so this cannot be a rule in a prompt.
+
+    So scope is set by the code from the request that arrived, and forced into
+    every query underneath. The model may narrow inside it and has no way to
+    widen past it.
+
+    Fails closed: an empty channel set matches nothing rather than everything.
+    A bug that loses the scope returns no rows, which is visible and harmless,
+    instead of returning someone else's chat.
+    """
+
+    channel_ids: frozenset[int]
+    guild_id: Optional[int] = None
+
+    @classmethod
+    def of(cls, channel_ids, guild_id: Optional[int] = None) -> "Scope":
+        return cls(frozenset(int(c) for c in channel_ids), guild_id)
+
+    def narrowed_to(self, channel_id: Optional[int]) -> "Scope":
+        """This scope restricted to one channel, or unchanged if that channel
+        is outside it. Narrowing is always allowed; widening never is."""
+        if channel_id is None:
+            return self
+        cid = int(channel_id)
+        return Scope(frozenset({cid}), self.guild_id) if cid in self.channel_ids else self
+
+    def __bool__(self) -> bool:
+        return bool(self.channel_ids)
+
+    def describe(self) -> str:
+        return (f"guild={self.guild_id or '-'} "
+                f"channels={len(self.channel_ids)}")
+
+
+def _scope_clause(scope: Scope) -> tuple[str, list[Any]]:
+    """The fence, as SQL. Always emitted, even for an empty scope."""
+    if not isinstance(scope, Scope):
+        raise TypeError(
+            "a Scope is required — every read is fenced to the channels the "
+            "request came from (db.Scope)"
+        )
+    # = ANY(array) rather than IN (...): one parameter whatever the channel
+    # count, so the SQL text is identical for every request and Postgres can
+    # reuse the plan.
+    return "channel_id = ANY(%s)", [list(scope.channel_ids)]
+
+
+def _build_where(
+    filters: Optional[dict[str, Any]], scope: Scope,
+) -> tuple[str, list[Any]]:
+    """Turn a filter dict into a WHERE fragment + ordered params, fenced to
+    `scope`.
 
     Supported keys: the equality fields in _EQ_FIELDS, plus two range pairs —
     'after' / 'before' (created_at bounds) and 'min_id' / 'max_id'
-    (discord_message_id bounds). Returns ("", []) when empty.
-    """
-    if not filters:
-        return "", []
+    (discord_message_id bounds).
 
-    clauses: list[str] = []
-    params: list[Any] = []
+    The scope clause is not one of them and is never optional: it is emitted
+    whether or not any filter is, and a channel_id filter can only narrow
+    within it. Returning a bare WHERE fence for empty filters is the point —
+    there is no code path here that produces an unfenced query.
+    """
+    if not isinstance(scope, Scope):
+        # Checked before the scope is used for anything, so a caller that
+        # forgot it gets a sentence naming the problem rather than an
+        # AttributeError from three lines down.
+        raise TypeError(
+            "a Scope is required — every read is fenced to the channels the "
+            "request came from (db.Scope)"
+        )
+    scope = scope.narrowed_to((filters or {}).get("channel_id"))
+    scope_sql, params = _scope_clause(scope)
+    clauses: list[str] = [scope_sql]
+
+    if not filters:
+        return "WHERE " + scope_sql, params
+
+    # channel_id is spent: the fence above already carries it, narrowed.
+    filters = {k: v for k, v in filters.items() if k != "channel_id"}
 
     for field in _EQ_FIELDS:
         if field in filters and filters[field] is not None:
@@ -637,8 +739,7 @@ def _build_where(filters: Optional[dict[str, Any]]) -> tuple[str, list[Any]]:
         clauses.append("discord_message_id <= %s")
         params.append(filters["max_id"])
 
-    if not clauses:
-        return "", []
+    # clauses always holds the fence, so there is no empty-WHERE branch.
     return "WHERE " + " AND ".join(clauses), params
 
 
@@ -648,6 +749,7 @@ def _build_where(filters: Optional[dict[str, Any]]) -> tuple[str, list[Any]]:
 
 async def structured_search(
     *,
+    scope: Scope,
     filters: Optional[dict[str, Any]] = None,
     order_by: str = "created_at DESC",
     limit: int = 100,
@@ -663,7 +765,7 @@ async def structured_search(
     if order_by not in allowed:
         raise ValueError(f"order_by must be one of {sorted(allowed)}")
 
-    where, params = _build_where(filters)
+    where, params = _build_where(filters, scope)
     sql = f"SELECT * FROM messages {where} ORDER BY {order_by} LIMIT %s"
     pool = _get_pool()
     async with pool.connection() as conn:
@@ -678,6 +780,7 @@ async def structured_search(
 async def keyword_search(
     term: str,
     *,
+    scope: Scope,
     filters: Optional[dict[str, Any]] = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
@@ -686,9 +789,9 @@ async def keyword_search(
     TODO: ILIKE is a placeholder. Swap for pg_trgm or full-text search once the
     term-matching requirements are clearer (see schema note).
     """
-    where, params = _build_where(filters)
-    joiner = "AND" if where else "WHERE"
-    sql = f"SELECT * FROM messages {where} {joiner} content ILIKE %s ORDER BY created_at DESC LIMIT %s"
+    where, params = _build_where(filters, scope)
+    sql = (f"SELECT * FROM messages {where} AND content ILIKE %s "
+           f"ORDER BY created_at DESC LIMIT %s")
     pool = _get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(sql, [*params, f"%{term}%", limit])
@@ -699,14 +802,21 @@ async def keyword_search(
 # Retrieval instrument 3: anchor-based (structural, not semantic)
 # ---------------------------------------------------------------------------
 
-async def replies_to(discord_message_id: int, *, limit: int = 100) -> list[dict[str, Any]]:
-    """Messages that were direct replies to a given message."""
+async def replies_to(
+    discord_message_id: int, *, scope: Scope, limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Messages that were direct replies to a given message, inside `scope`.
+
+    Fenced like every other read: an anchor id is just a number, and one from
+    another server would otherwise pull that server's replies back.
+    """
+    scope_sql, params = _scope_clause(scope)
     pool = _get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT * FROM messages WHERE reply_to_message_id = %s "
-            "ORDER BY created_at ASC LIMIT %s",
-            (discord_message_id, limit),
+            f"SELECT * FROM messages WHERE {scope_sql} AND reply_to_message_id = %s "
+            f"ORDER BY created_at ASC LIMIT %s",
+            (*params, discord_message_id, limit),
         )
         return await cur.fetchall()
 
@@ -714,6 +824,7 @@ async def replies_to(discord_message_id: int, *, limit: int = 100) -> list[dict[
 async def messages_near(
     anchor: datetime,
     *,
+    scope: Scope,
     window_minutes: int = 30,
     channel_id: Optional[int] = None,
     limit: int = 100,
@@ -724,12 +835,11 @@ async def messages_near(
     the conversation surrounding a hit without any semantic assumption.
     """
     anchor = _as_utc(anchor)
-    clauses = ["created_at BETWEEN %s - make_interval(mins => %s) "
+    scope_sql, scope_params = _scope_clause(scope.narrowed_to(channel_id))
+    clauses = [scope_sql,
+               "created_at BETWEEN %s - make_interval(mins => %s) "
                "AND %s + make_interval(mins => %s)"]
-    params: list[Any] = [anchor, window_minutes, anchor, window_minutes]
-    if channel_id is not None:
-        clauses.append("channel_id = %s")
-        params.append(channel_id)
+    params: list[Any] = [*scope_params, anchor, window_minutes, anchor, window_minutes]
     sql = f"SELECT * FROM messages WHERE {' AND '.join(clauses)} ORDER BY created_at ASC LIMIT %s"
     params.append(limit)
     pool = _get_pool()
@@ -747,10 +857,11 @@ async def messages_near(
 
 async def message_counts_by_author(
     *,
+    scope: Scope,
     filters: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """Total messages per author within an optional filter (the denominators)."""
-    where, params = _build_where(filters)
+    where, params = _build_where(filters, scope)
     sql = f"SELECT author_id, COUNT(*) AS total FROM messages {where} GROUP BY author_id"
     pool = _get_pool()
     async with pool.connection() as conn:
@@ -764,6 +875,7 @@ async def message_counts_by_author(
 
 async def activity_stats(
     *,
+    scope: Scope,
     group_by: str = "author_id",
     filters: Optional[dict[str, Any]] = None,
     limit: int = 50,
@@ -795,7 +907,7 @@ async def activity_stats(
     # The bucket expression sits in the SELECT list, ahead of the WHERE params.
     # GROUP BY 1 rather than repeating it keeps that ordering to one binding.
     params: list[Any] = [str(CORPUS_TZ)] if "%s" in expr else []
-    where, where_params = _build_where(filters)
+    where, where_params = _build_where(filters, scope)
     params.extend(where_params)
 
     sql = f"""
@@ -962,6 +1074,7 @@ async def recent_day_summaries(
 
 async def read_summaries(
     *,
+    scope: Scope,
     channel_id: Optional[int] = None,
     after: Optional[date] = None,
     before: Optional[date] = None,
@@ -983,11 +1096,9 @@ async def read_summaries(
     if granularity not in ("day", "session"):
         raise ValueError("granularity must be 'day' or 'session'")
 
-    clauses = ["granularity = %s"]
-    params: list[Any] = [granularity]
-    if channel_id is not None:
-        clauses.append("channel_id = %s")
-        params.append(channel_id)
+    scope_sql, scope_params = _scope_clause(scope.narrowed_to(channel_id))
+    clauses = [scope_sql, "granularity = %s"]
+    params: list[Any] = [*scope_params, granularity]
     if after is not None:
         clauses.append("summary_date >= %s")
         params.append(after)
@@ -1013,19 +1124,22 @@ async def read_summaries(
         return await cur.fetchall()
 
 
-async def summary_date_range(channel_id: Optional[int] = None) -> dict[str, Any]:
+async def summary_date_range(
+    *, scope: Scope, channel_id: Optional[int] = None,
+) -> dict[str, Any]:
     """How much summarized history exists: first date, last date, and how many.
 
     What a reader needs before asking for a range — "summarize last month" is
     unanswerable if the summariser has only ever covered a week, and finding
     that out by getting a short result back is guesswork.
     """
-    where, params = ("WHERE channel_id = %s", [channel_id]) if channel_id else ("", [])
+    scope_sql, params = _scope_clause(scope.narrowed_to(channel_id))
     sql = f"""
         SELECT MIN(summary_date) AS first_day,
                MAX(summary_date) AS last_day,
                COUNT(*)          AS days
-          FROM day_summaries {where} {"AND" if where else "WHERE"} granularity = 'day'
+          FROM day_summaries
+         WHERE {scope_sql} AND granularity = 'day'
     """
     pool = _get_pool()
     async with pool.connection() as conn:
@@ -1190,6 +1304,7 @@ async def set_cluster_embedding(
 async def similarity_search(
     embedding: Sequence[float],
     *,
+    scope: Scope,
     channel_id: Optional[int] = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
@@ -1205,12 +1320,8 @@ async def similarity_search(
     nothing. The `embedding IS NOT NULL` predicate also keeps this off any
     cluster the embed pass has not reached yet.
     """
-    clauses = ["embedding IS NOT NULL"]
-    filter_params: list[Any] = []
-    if channel_id is not None:
-        clauses.append("channel_id = %s")
-        filter_params.append(channel_id)
-    where = "WHERE " + " AND ".join(clauses)
+    scope_sql, filter_params = _scope_clause(scope.narrowed_to(channel_id))
+    where = "WHERE " + " AND ".join([scope_sql, "embedding IS NOT NULL"])
 
     # The query vector binds twice — once for the returned distance, once for
     # the ORDER BY that the HNSW index actually answers.

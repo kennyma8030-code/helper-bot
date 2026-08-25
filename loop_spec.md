@@ -49,6 +49,21 @@ says "chunk", because nothing here slices documents:
   worth reading — never citable evidence, because its text is model-written
   (db.py `similarity_search` note; specs-summaries.md decision 2).
 
+**Scope.** Every run is fenced to the channels the request came from — one
+server's stored history, or one channel for a direct message. The fence is set
+by the code from the incoming request (`db.Scope`, built in `bot._scope_for`)
+and forced into every query underneath by `db._build_where`. It is not a tool
+argument and the model cannot see or reach it: a worker may narrow to one
+channel inside the fence, and a `channel_id` naming a channel outside it is
+ignored rather than honoured.
+
+This is deliberately not a prompt rule. Every instrument's `channel_id` filter
+is optional, and a model omitting an optional argument is ordinary behaviour —
+which, with the bot in two servers, would mean answering one group's question
+out of another group's private history. The fence fails closed: an empty scope
+matches nothing rather than everything, so a bug that loses it returns no
+evidence instead of someone else's.
+
 A single **orchestrator** runs the loop. Each iteration is a **wave**:
 
 ```

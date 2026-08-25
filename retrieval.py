@@ -269,30 +269,47 @@ def _compact_summary(row: dict[str, Any], *, full: bool) -> dict[str, Any]:
     return out
 
 
-async def execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
-    """Run one instrument. Raises on an unknown tool or a bad argument."""
+async def execute_call(
+    name: str, args: dict[str, Any], *, scope: db.Scope,
+) -> list[dict[str, Any]]:
+    """Run one instrument, fenced to `scope`.
+
+    `scope` is not one of the model's arguments and cannot be reached from
+    them. Every db read underneath requires it, and a channel_id in `args` can
+    only narrow within it — a channel outside the fence is ignored rather than
+    honoured. That is the whole of multi-server isolation: it lives here and in
+    db._build_where, not in a prompt, because a model omitting an argument is
+    ordinary behaviour and would otherwise mean answering one server's question
+    out of another server's history.
+    """
     filters, rest = _split_args(args)
     limit = max(1, min(int(rest.get("limit", 20)), MAX_ROWS_PER_CALL))
+    channel_id = int(filters["channel_id"]) if "channel_id" in filters else None
 
     if name == "structured_search":
         rows = await db.structured_search(
+            scope=scope,
             filters=filters or None,
             order_by=str(rest.get("order_by", "created_at DESC")),
             limit=limit,
         )
     elif name == "keyword_search":
-        rows = await db.keyword_search(str(rest["term"]), filters=filters or None, limit=limit)
+        rows = await db.keyword_search(
+            str(rest["term"]), scope=scope, filters=filters or None, limit=limit)
     elif name == "replies_to":
-        rows = await db.replies_to(int(rest["discord_message_id"]), limit=limit)
+        rows = await db.replies_to(
+            int(rest["discord_message_id"]), scope=scope, limit=limit)
     elif name == "messages_near":
         rows = await db.messages_near(
             datetime.fromisoformat(str(rest["anchor"])),
+            scope=scope,
             window_minutes=int(rest.get("window_minutes", 30)),
-            channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
+            channel_id=channel_id,
             limit=limit,
         )
     elif name == "activity_stats":
         rows = await db.activity_stats(
+            scope=scope,
             group_by=str(rest.get("group_by", "author_id")),
             filters=filters or None,
             limit=limit,
@@ -304,7 +321,8 @@ async def execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
         # covering a stretch, and quietly handing back 20 days of a 60-day
         # question is worse than handing back all of it.
         rows = await db.read_summaries(
-            channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
+            scope=scope,
+            channel_id=channel_id,
             # _split_args parses these into datetimes; the column is a date.
             after=filters["after"].date() if "after" in filters else None,
             before=filters["before"].date() if "before" in filters else None,
@@ -312,9 +330,7 @@ async def execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
         )
         return [_compact_summary(r, full=full) for r in rows]
     elif name == "summary_coverage":
-        row = await db.summary_date_range(
-            int(filters["channel_id"]) if "channel_id" in filters else None
-        )
+        row = await db.summary_date_range(scope=scope, channel_id=channel_id)
         return [{"first_day": str(row["first_day"]) if row["first_day"] else None,
                  "last_day": str(row["last_day"]) if row["last_day"] else None,
                  "days_summarized": row["days"]}]
@@ -323,9 +339,7 @@ async def execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
         # sides are not interchangeable for this model.
         vectors = await embed_texts([str(rest["query"])], is_query=True)
         rows = await db.similarity_search(
-            vectors[0],
-            channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
-            limit=limit,
+            vectors[0], scope=scope, channel_id=channel_id, limit=limit,
         )
     else:
         raise ValueError(f"unknown tool: {name}")

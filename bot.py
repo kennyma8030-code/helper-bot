@@ -273,6 +273,33 @@ async def respond(interaction: discord.Interaction, on: bool):
     await interaction.followup.send("Replied.", ephemeral=True)
 
 
+async def _scope_for(interaction: discord.Interaction) -> db.Scope:
+    """The channels a request from this interaction may read.
+
+    One server's worth: the question was asked in a server, so the whole of
+    that server's stored history is in range and nothing else is. Within it a
+    worker may narrow to one channel; it has no way to reach past it.
+
+    Built from what is STORED, not from what Discord currently reports. A
+    channel the bot has since lost access to still holds history that belongs
+    to this server, and the fence should cover it rather than silently drop it.
+
+    A direct message has no guild. Those fall back to the one channel they came
+    from, which is the only history that could belong to that conversation.
+    """
+    if interaction.guild_id is None:
+        return db.Scope.of(
+            [interaction.channel_id] if interaction.channel_id else [], None
+        )
+    channels = await db.known_channel_ids(interaction.guild_id)
+    if not channels and interaction.channel_id:
+        # Nothing carries this guild_id yet — every row predates the column and
+        # is waiting on the repair walk to backfill it. Fall back to the channel
+        # the question came from, which is always correct if narrow.
+        return db.Scope.of([interaction.channel_id], interaction.guild_id)
+    return db.Scope.of(channels, interaction.guild_id)
+
+
 @tree.command(name="ask", description="Answer a question from the chat's history.")
 @app_commands.describe(ask="What you want to know")
 async def ask_command(interaction: discord.Interaction, ask: str):
@@ -287,8 +314,16 @@ async def ask_command(interaction: discord.Interaction, ask: str):
     await db.open_pool()
     await db.init_db()
 
+    scope = await _scope_for(interaction)
+    if not scope:
+        await interaction.followup.send(
+            "I have no stored history for this server yet — run /backfill in a "
+            "channel first."
+        )
+        return
+
     try:
-        answer = await loop.answer(ask)
+        answer = await loop.answer(ask, scope=scope)
     except Exception as e:
         print(f"[/ask] investigation failed: {type(e).__name__}: {e}", flush=True)
         await interaction.followup.send(
@@ -374,6 +409,10 @@ async def _walk_channel(
             reply_to_message_id=(
                 m.reference.message_id if m.reference else None
             ),
+            # What backfills guild_id onto rows written before the column
+            # existed: the repair walk re-reads recent history every day, and
+            # the upsert only ever fills the value in, never clears it.
+            guild_id=m.guild.id if m.guild else None,
         )
         if not inserted:
             continue
@@ -760,6 +799,7 @@ async def on_message(message):
                 reply_to_message_id=(
                     message.reference.message_id if message.reference else None
                 ),
+                guild_id=message.guild.id if message.guild else None,
             )
         except Exception as e:
             print(

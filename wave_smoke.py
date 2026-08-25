@@ -72,6 +72,9 @@ async def fake_embed(texts, *, is_query=False):
     return out
 
 
+# The fence every test run is executed inside.
+SCOPE = db.Scope.of([9, 10], guild_id=42)
+
 ROWS = [
     {"discord_message_id": 1401, "channel_id": 9, "author_id": 77,
      "content": "moving my brother saturday, can't do the cabin",
@@ -93,6 +96,7 @@ class Scenario:
         self.worker_delay = worker_delay
         self.worker_raises = worker_raises
         self.calls = []
+        self.scopes = []
         self._i = {"plan": 0, "grade": 0, "suff": 0}
 
     def _next(self, key, seq):
@@ -130,7 +134,12 @@ class Scenario:
         budget.record(response)
         return response
 
-    async def execute_call(self, name, args):
+    async def execute_call(self, name, args, *, scope=None):
+        # Asserted, not ignored: the fence is the one thing in this file that
+        # protects one server's history from another's question, so a refactor
+        # that drops it on the way down should fail here.
+        assert scope is not None and scope.channel_ids, f"unfenced call: {name}"
+        self.scopes.append(scope)
         return list(ROWS)
 
     def count(self, role):
@@ -175,7 +184,7 @@ SUFF_YES = {"sufficient": "yes", "gaps": [], "note": "ledger answers it"}
 async def case_happy():
     s = Scenario(plan=[PLAN_TWO], grade=[GRADE_RESOLVED], sufficient=[SUFF_YES])
     install(s)
-    run = await loop.investigate("why did the cabin trip move?")
+    run = await loop.investigate("why did the cabin trip move?", scope=SCOPE)
     assert run.verdict == "yes", run.verdict
     assert run.waves == 1
     assert len(run.ledger.facts) == 2 and run.ledger.facts[0]["id"] == "F1"
@@ -199,7 +208,7 @@ async def case_two_waves():
                  sufficient=[{"sufficient": "no", "gaps": ["whether Sam agreed"],
                               "note": "one gap"}, SUFF_YES])
     install(s)
-    run = await loop.investigate("why did the cabin trip move?")
+    run = await loop.investigate("why did the cabin trip move?", scope=SCOPE)
     assert run.waves == 2 and run.verdict == "yes"
     # Unresolved entering the last round, so that round goes to the large model.
     assert loop.LARGE_MODEL in s.models_for("worker")
@@ -216,7 +225,7 @@ async def case_escalate_on_ambiguous():
     s = Scenario(plan=[PLAN_TWO], grade=[unsure, unsure, GRADE_RESOLVED],
                  sufficient=[SUFF_YES])
     install(s)
-    run = await loop.investigate("q", cfg=loop.WaveConfig(worker_max_iters=4))
+    run = await loop.investigate("q", scope=SCOPE, cfg=loop.WaveConfig(worker_max_iters=4))
     assert run.trajectory[0]["results"][0]["escalated"] is True
     assert loop.LARGE_MODEL in s.models_for("worker")
     return "grader ambiguity escalated before the final round"
@@ -226,7 +235,7 @@ async def case_no_escalation_when_resolved():
     """A worker that resolves on round 1 must never reach the large model."""
     s = Scenario(plan=[PLAN_TWO], grade=[GRADE_RESOLVED], sufficient=[SUFF_YES])
     install(s)
-    run = await loop.investigate("q")
+    run = await loop.investigate("q", scope=SCOPE)
     assert all(m == loop.SMALL_MODEL for m in s.models_for("worker")), s.models_for("worker")
     assert not any(r["escalated"] for r in run.trajectory[0]["results"])
     return "resolved on round 1 stayed on the small model"
@@ -236,7 +245,7 @@ async def case_fallback():
     s = Scenario(plan=[{"sub_questions": [], "note": "cannot split"}],
                  grade=[GRADE_RESOLVED], sufficient=[SUFF_YES])
     install(s)
-    run = await loop.investigate("what happened?")
+    run = await loop.investigate("what happened?", scope=SCOPE)
     assert run.trajectory[0]["sub_questions"] == ["what happened?"]
     assert s.count("worker") == 1
     return "wave 1 fell back to the original question as one sub-question"
@@ -247,7 +256,7 @@ async def case_stalled():
                  grade=[dict(GRADE_RESOLVED, status="refine", gap="x")],
                  sufficient=[{"sufficient": "no", "gaps": ["x"], "note": "more"}])
     install(s)
-    run = await loop.investigate("q")
+    run = await loop.investigate("q", scope=SCOPE)
     assert run.verdict == "stalled", run.verdict
     return f"verdict={run.verdict} after {run.waves} waves"
 
@@ -256,7 +265,7 @@ async def case_timeout():
     s = Scenario(plan=[PLAN_TWO], grade=[GRADE_RESOLVED], sufficient=[SUFF_YES],
                  worker_delay=0.30)
     install(s)
-    run = await loop.investigate("q", cfg=loop.WaveConfig(worker_timeout_s=0.05))
+    run = await loop.investigate("q", scope=SCOPE, cfg=loop.WaveConfig(worker_timeout_s=0.05))
     statuses = [r["status"] for r in run.trajectory[0]["results"]]
     assert statuses == ["timeout", "timeout"], statuses
     assert run.ledger.facts == []
@@ -269,7 +278,7 @@ async def case_worker_error():
                               "note": "nothing came back"}],
                  worker_raises=True)
     install(s)
-    run = await loop.investigate("q")
+    run = await loop.investigate("q", scope=SCOPE)
     assert [r["status"] for r in run.trajectory[0]["results"]] == ["error", "error"]
     assert run.verdict == "unanswerable"
     return f"worker exceptions became gaps, verdict={run.verdict}"
@@ -281,7 +290,7 @@ async def case_worker_error_deterministic():
                  sufficient=[{"sufficient": "unanswerable", "gaps": [], "note": ""}],
                  worker_raises=True)
     install(s)
-    run = await loop.investigate("q", cfg=loop.WaveConfig(deterministic=True))
+    run = await loop.investigate("q", scope=SCOPE, cfg=loop.WaveConfig(deterministic=True))
     assert [r["status"] for r in run.trajectory[0]["results"]] == ["error", "error"]
     return "sequential path survived a worker exception too"
 
@@ -291,7 +300,7 @@ async def case_budget():
                  grade=[dict(GRADE_RESOLVED, status="refine", gap="g")],
                  sufficient=[{"sufficient": "no", "gaps": ["g"], "note": "more"}])
     install(s)
-    run = await loop.investigate("q", cfg=loop.WaveConfig(max_llm_calls=4, max_waves=3))
+    run = await loop.investigate("q", scope=SCOPE, cfg=loop.WaveConfig(max_llm_calls=4, max_waves=3))
     assert run.verdict == "budget_exhausted", run.verdict
     assert run.llm_calls <= 8, run.llm_calls
     return f"stopped at {run.llm_calls} calls against a cap of 4, verdict={run.verdict}"
@@ -307,7 +316,7 @@ async def case_bad_citations():
                         "note": ""}],
                  grade=[bad], sufficient=[SUFF_YES])
     install(s)
-    run = await loop.investigate("q")
+    run = await loop.investigate("q", scope=SCOPE)
     claims = [f["claim"] for f in run.ledger.facts]
     assert claims == ["good one"], claims
     return "kept the cited fact, rejected the two without citations"
@@ -320,7 +329,7 @@ async def case_dedup():
     ], "note": "accidental repeat"}
     s = Scenario(plan=[dupe], grade=[GRADE_RESOLVED], sufficient=[SUFF_YES])
     install(s)
-    run = await loop.investigate("q")
+    run = await loop.investigate("q", scope=SCOPE)
     assert s.count("worker") == 1
     assert run.trajectory[0]["deduped"] == ["when was the cabin trip moved to"]
     return "two identical sub-questions became one worker"
@@ -329,12 +338,57 @@ async def case_dedup():
 async def case_answer_seam():
     s = Scenario(plan=[PLAN_TWO], grade=[GRADE_RESOLVED], sufficient=[SUFF_YES])
     install(s)
-    text = await loop.answer("why did the cabin trip move?")
+    text = await loop.answer("why did the cabin trip move?", scope=SCOPE)
     assert text == "ANSWER FROM LEDGER", text
     return "bot.py's seam still returns synthesized text"
 
 
+async def case_scope_fence():
+    """The multi-server fence, tested on the SQL builder directly.
+
+    No loop and no database: _build_where is where isolation is actually
+    enforced, so this asserts on the clause it emits.
+    """
+    scope = db.Scope.of([9, 10], guild_id=42)
+
+    # 1. The fence is emitted even when nothing else is.
+    where, params = db._build_where(None, scope)
+    assert where == "WHERE channel_id = ANY(%s)", where
+    assert sorted(params[0]) == [9, 10], params
+
+    # 2. A channel inside the scope narrows it.
+    where, params = db._build_where({"channel_id": 9}, scope)
+    assert params[0] == [9], params
+    assert where.count("channel_id") == 1, where
+
+    # 3. A channel OUTSIDE the scope cannot widen it. The argument is ignored
+    #    and the fence stands — the leak this whole change exists to prevent.
+    where, params = db._build_where({"channel_id": 999}, scope)
+    assert 999 not in params[0], params
+    assert sorted(params[0]) == [9, 10], params
+
+    # 4. Other filters still compose, behind the fence.
+    where, params = db._build_where({"author_id": 77, "min_id": 1400}, scope)
+    assert where.startswith("WHERE channel_id = ANY(%s)"), where
+    assert "author_id = %s" in where and "discord_message_id >= %s" in where
+
+    # 5. An empty scope matches nothing rather than everything.
+    where, params = db._build_where({"author_id": 77}, db.Scope.of([]))
+    assert params[0] == [], params
+
+    # 6. Forgetting the scope is an error, not an unfenced query.
+    try:
+        db._build_where({"author_id": 77}, None)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("a missing scope must raise, never run unfenced")
+
+    return "fence holds: narrows in, never widens, fails closed"
+
+
 CASES = [
+    ("scope fence", case_scope_fence),
     ("happy path", case_happy),
     ("two waves + escalation", case_two_waves),
     ("escalate on ambiguity", case_escalate_on_ambiguous),

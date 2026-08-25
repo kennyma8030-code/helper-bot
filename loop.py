@@ -719,6 +719,7 @@ async def _run_worker(
     ledger: Ledger,
     cfg: WaveConfig,
     budget: Budget,
+    scope: db.Scope,
     tag: str = "w",
 ) -> WorkerResult:
     """Retrieve for one sub-question. Bounded iterations, no spawning."""
@@ -770,7 +771,7 @@ async def _run_worker(
             result.calls.append({"tool": name, "args": args, "round": iteration})
 
         raw = await asyncio.gather(
-            *(retrieval.execute_call(name, args) for name, args in specs),
+            *(retrieval.execute_call(name, args, scope=scope) for name, args in specs),
             return_exceptions=True,
         )
         executed = [(name, args, res) for (name, args), res in zip(specs, raw)]
@@ -857,6 +858,7 @@ async def _dispatch(
     ledger: Ledger,
     cfg: WaveConfig,
     budget: Budget,
+    scope: db.Scope,
 ) -> list[WorkerResult]:
     """Run one wave's workers and join them at the barrier.
 
@@ -869,7 +871,7 @@ async def _dispatch(
         async with semaphore:
             try:
                 return await asyncio.wait_for(
-                    _run_worker(sub, ledger, cfg, budget, tag),
+                    _run_worker(sub, ledger, cfg, budget, scope, tag),
                     timeout=cfg.worker_timeout_s,
                 )
             except asyncio.TimeoutError:
@@ -1024,8 +1026,15 @@ def _snapshot(cfg: WaveConfig, run_id: str, wave: int, payload: dict[str, Any]) 
 # The orchestrator
 # ---------------------------------------------------------------------------
 
-async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> WaveRun:
-    """Run the wave loop. Returns the full record of what happened."""
+async def investigate(
+    question: str, *, scope: db.Scope, cfg: Optional[WaveConfig] = None,
+) -> WaveRun:
+    """Run the wave loop, fenced to `scope`. Returns the record of what happened.
+
+    `scope` comes from the request — the server and channel the question was
+    asked in — and every retrieval underneath is fenced to it. It is not a
+    parameter the model can see or reach.
+    """
     cfg = cfg or WaveConfig()
     ledger = Ledger(question)
     budget = Budget(max_llm_calls=cfg.max_llm_calls, max_tokens=cfg.max_tokens)
@@ -1041,6 +1050,13 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
     log.info("ask: %s", _clip(question, 160))
     log.info("  run %s - up to %d wave(s), %d worker(s), %d call(s)",
              run_id, cfg.max_waves, cfg.max_concurrent, cfg.max_llm_calls)
+    log.info("  scope: %s", scope.describe())
+
+    if not scope:
+        # Fails closed rather than searching everything. An empty scope is a
+        # bug upstream, and the honest outcome is no evidence, not someone
+        # else's.
+        log.warning("  empty scope - nothing is in range for this request")
 
     while wave < cfg.max_waves:
         wave += 1
@@ -1076,7 +1092,7 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
         for i, sub in enumerate(subs, start=1):
             log.info("    w%d  %s", i, _clip(sub.text, 90))
 
-        results = await _dispatch(subs, ledger, cfg, budget)
+        results = await _dispatch(subs, ledger, cfg, budget, scope)
         # The sub-questions are now spent: record their vectors so a later
         # wave's planner cannot hand the same work out again under new wording.
         ledger.attempted_vectors.extend(s.vector for s in subs if s.vector)
@@ -1171,9 +1187,11 @@ async def synthesize(run: WaveRun) -> str:
     return text[:1990] + "…" if len(text) > 1990 else text
 
 
-async def answer(question: str, *, cfg: Optional[WaveConfig] = None) -> str:
+async def answer(
+    question: str, *, scope: db.Scope, cfg: Optional[WaveConfig] = None,
+) -> str:
     """Full pipeline: investigate -> synthesize. The bot.py seam."""
-    run = await investigate(question, cfg=cfg)
+    run = await investigate(question, scope=scope, cfg=cfg)
     answer_text = await synthesize(run)
     _log_block(f"answer ({len(answer_text)} chars):", answer_text)
     return answer_text
