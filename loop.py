@@ -45,6 +45,35 @@ from prompts import (
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Log formatting — the log is read by a person, so it is written for one
+# ---------------------------------------------------------------------------
+
+def _clip(text: str, width: int = 100) -> str:
+    """One line, bounded. Claims and questions are prose and run long."""
+    line = " ".join(str(text).split())
+    return line if len(line) <= width else line[:width - 3] + "..."
+
+
+def _fmt_args(args: dict[str, Any]) -> str:
+    """Tool arguments as short key=value pairs.
+
+    Not JSON: a search carrying eight filters becomes a line of punctuation
+    that hides the two arguments that actually mattered.
+    """
+    parts = []
+    for key, value in args.items():
+        if value is None:
+            continue
+        parts.append(f"{key}={_clip(value, 32)}")
+    return " ".join(parts) or "(no args)"
+
+
+def _tokens(n: int) -> str:
+    """1234 -> '1.2k'. Token counts are read for magnitude, not precision."""
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
 # Model tiers come from llm.py (LARGE_MODEL, SMALL_MODEL): planning gates
 # everything downstream and synthesis is the answer a human reads, so both take
 # the large tier; the per-iteration work that runs many times over takes the
@@ -254,6 +283,34 @@ class Ledger:
             lines.extend(f"  - {b}" for b in self.dead_branches)
         return "\n".join(lines)
 
+    def summary(self) -> str:
+        """Compact view, for the log. What is in the ledger, not the evidence.
+
+        render() carries every citation body because synthesis has to read
+        them. A log does not: a wave that added six facts should be six lines,
+        not six paragraphs of quoted chat. The citation *count* is what a
+        reader scanning a log actually wants — it is how a thinly supported
+        claim announces itself.
+        """
+        if not (self.facts or self.inferences or self.open_questions or self.dead_branches):
+            return "(empty)"
+        lines = [
+            f"facts={len(self.facts)} inferences={len(self.inferences)} "
+            f"open={len(self.open_questions)} dead={len(self.dead_branches)} "
+            f"messages_seen={len(self.message_ids)}"
+        ]
+        for f in self.facts:
+            n = len(f["citations"])
+            lines.append(f"  {f['id']} {_clip(f['claim'])}  [{n} cite{'' if n == 1 else 's'}]")
+        for i in self.inferences:
+            lines.append(f"  {i['id']} {_clip(i['claim'])}  "
+                         f"[from {', '.join(i['based_on']) or '-'}]")
+        for q in self.open_questions:
+            lines.append(f"  open: {_clip(q)}")
+        for b in self.dead_branches:
+            lines.append(f"  dead: {_clip(b)}")
+        return "\n".join(lines)
+
     def digest(self) -> str:
         """What the planner sees: established facts, and what is still open.
 
@@ -449,17 +506,18 @@ async def _call_model(
     budget.record(response)
     await track_usage(model, response)
 
-    # One line per model call, so a wave's cost is readable as it happens rather
-    # than reconstructed from the running total afterwards. `cached` is the part
-    # of the input the server billed at the cache rate — it is what tells you
-    # whether the worker cache actually engaged, which nothing else reveals.
+    # One short line per model call, so a wave's cost is readable as it happens
+    # rather than reconstructed afterwards from the running total. `cached` is
+    # the slice of the input billed at the cache rate — the only signal that
+    # says whether the worker cache actually engaged.
     usage = getattr(response, "usage_metadata", None)
     prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
     total_tokens = getattr(usage, "total_token_count", 0) or 0 if usage else 0
     cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0 if usage else 0
-    log.info("    call %-11s %-22s in=%-6d out=%-5d%s  [%d/%d calls]",
-             label, model, prompt_tokens, max(total_tokens - prompt_tokens, 0),
-             f" cached={cached_tokens}" if cached_tokens else "",
+    log.info("      - %-11s %-5s %s->%s%s  [%d/%d]",
+             label, "large" if model == LARGE_MODEL else "small",
+             _tokens(prompt_tokens), _tokens(max(total_tokens - prompt_tokens, 0)),
+             f" cached {_tokens(cached_tokens)}" if cached_tokens else "",
              budget.llm_calls, budget.max_llm_calls)
     return response
 
@@ -661,6 +719,7 @@ async def _run_worker(
     ledger: Ledger,
     cfg: WaveConfig,
     budget: Budget,
+    tag: str = "w",
 ) -> WorkerResult:
     """Retrieve for one sub-question. Bounded iterations, no spawning."""
     result = WorkerResult(sub_question=sub.text, status="unresolvable")
@@ -707,8 +766,7 @@ async def _run_worker(
 
         specs = [(c.name, dict(c.args or {})) for c in calls]
         for name, args in specs:
-            log.info("    [w] %s: %s(%s)", sub.text[:40], name,
-                     json.dumps(args, default=str))
+            log.info("    %s r%d  %s %s", tag, iteration, name, _fmt_args(args))
             result.calls.append({"tool": name, "args": args, "round": iteration})
 
         raw = await asyncio.gather(
@@ -718,7 +776,8 @@ async def _run_worker(
         executed = [(name, args, res) for (name, args), res in zip(specs, raw)]
         for name, args, res in executed:
             if isinstance(res, BaseException):
-                log.warning("    [w] %s failed: %s: %s", name, type(res).__name__, res)
+                log.warning("    %s r%d  %s FAILED %s: %s",
+                            tag, iteration, name, type(res).__name__, res)
 
         rendered, ids = _grading_input(executed)
         result.message_ids.extend(ids)
@@ -744,7 +803,7 @@ async def _run_worker(
         graded = _extract_json(grade_text) or {}
 
         if not graded:
-            log.warning("    [w] %s: grader returned no JSON", sub.text[:40])
+            log.warning("    %s r%d  grader returned no JSON", tag, iteration)
             history.append(f"Round {iteration}: results could not be judged.")
             continue
 
@@ -756,10 +815,10 @@ async def _run_worker(
         result.note = str(graded.get("note") or "")
         ambiguous = bool(graded.get("ambiguous"))
 
-        log.info("    [w] %s: round %d -> %s%s (%d facts)",
-                 sub.text[:40], iteration, result.status,
-                 " [ambiguous]" if ambiguous else "",
-                 len(graded.get("facts") or []))
+        log.info("    %s r%d  -> %s%s, %d fact(s) from %d row(s)",
+                 tag, iteration, result.status,
+                 " (ambiguous)" if ambiguous else "",
+                 len(graded.get("facts") or []), len(ids))
 
         if result.status in ("resolved", "unresolvable"):
             break
@@ -779,8 +838,8 @@ async def _run_worker(
         if not result.escalated and (ambiguous or last_round):
             model = LARGE_MODEL
             result.escalated = True
-            log.info("    [w] %s: escalating to %s (%s)", sub.text[:40], LARGE_MODEL,
-                     "grader was unsure" if ambiguous else "final round")
+            log.info("    %s     escalating to large (%s)",
+                     tag, "grader unsure" if ambiguous else "final round")
 
         found = "; ".join(f"{f.get('claim')}" for f in (graded.get("facts") or [])[:5])
         history.append(
@@ -806,16 +865,16 @@ async def _dispatch(
     """
     semaphore = asyncio.Semaphore(cfg.max_concurrent)
 
-    async def guarded(sub: SubQuestion) -> WorkerResult:
+    async def guarded(sub: SubQuestion, tag: str) -> WorkerResult:
         async with semaphore:
             try:
                 return await asyncio.wait_for(
-                    _run_worker(sub, ledger, cfg, budget),
+                    _run_worker(sub, ledger, cfg, budget, tag),
                     timeout=cfg.worker_timeout_s,
                 )
             except asyncio.TimeoutError:
-                log.warning("  worker timed out after %.0fs: %s",
-                            cfg.worker_timeout_s, sub.text)
+                log.warning("    %s     TIMED OUT after %.0fs",
+                            tag, cfg.worker_timeout_s)
                 return WorkerResult(
                     sub_question=sub.text, status="timeout",
                     note=f"cancelled at the barrier after {cfg.worker_timeout_s:.0f}s",
@@ -825,22 +884,24 @@ async def _dispatch(
                 # sequential path fails the same way the parallel one does. A
                 # model error on one sub-question must cost that sub-question,
                 # never the wave.
-                log.warning("  worker failed on %r: %s: %s",
-                            sub.text, type(e).__name__, e)
+                log.warning("    %s     FAILED %s: %s", tag, type(e).__name__, e)
                 return WorkerResult(
                     sub_question=sub.text, status="error",
                     note=f"{type(e).__name__}: {e}",
                 )
 
+    tags = [f"w{i}" for i in range(1, len(subs) + 1)]
+
     if cfg.deterministic:
         # Sequential, in planner-priority order, so a run can be replayed.
-        return [await guarded(sub) for sub in subs]
+        return [await guarded(sub, tag) for sub, tag in zip(subs, tags)]
 
     # return_exceptions stays on as a backstop: guarded() handles Exception, but
     # a BaseException (a cancellation propagating in) would otherwise take the
     # whole gather down mid-wave.
-    settled = await asyncio.gather(*(guarded(sub) for sub in subs),
-                                   return_exceptions=True)
+    settled = await asyncio.gather(
+        *(guarded(sub, tag) for sub, tag in zip(subs, tags)),
+        return_exceptions=True)
     results: list[WorkerResult] = []
     for sub, outcome in zip(subs, settled):
         if isinstance(outcome, BaseException):
@@ -977,8 +1038,9 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
 
     await db.open_pool()
 
-    log.info("investigating %r (run %s; up to %d waves, %d workers, %d llm calls)",
-             question, run_id, cfg.max_waves, cfg.max_concurrent, cfg.max_llm_calls)
+    log.info("ask: %s", _clip(question, 160))
+    log.info("  run %s - up to %d wave(s), %d worker(s), %d call(s)",
+             run_id, cfg.max_waves, cfg.max_concurrent, cfg.max_llm_calls)
 
     while wave < cfg.max_waves:
         wave += 1
@@ -988,12 +1050,14 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
             break
 
         subs, plan_note = await _plan(question, ledger, wave, gaps, cfg, budget)
-        log.info("wave %d: planner proposed %d sub-question(s)%s",
-                 wave, len(subs), f" — {plan_note}" if plan_note else "")
+        log.info("")
+        log.info("WAVE %d", wave)
+        log.info("  plan: %d sub-question(s)%s",
+                 len(subs), f" - {_clip(plan_note, 80)}" if plan_note else "")
 
         subs, dropped = await _dedup(subs, ledger, cfg)
         for text in dropped:
-            log.info("  deduped (already worked): %s", text)
+            log.info("    deduped (already asked): %s", _clip(text, 70))
 
         if not subs:
             if wave == 1:
@@ -1009,8 +1073,8 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
                 log.info("  nothing left to ask; stopping")
                 break
 
-        for sub in subs:
-            log.info("  sub-question (p%d): %s", sub.priority, sub.text)
+        for i, sub in enumerate(subs, start=1):
+            log.info("    w%d  %s", i, _clip(sub.text, 90))
 
         results = await _dispatch(subs, ledger, cfg, budget)
         # The sub-questions are now spent: record their vectors so a later
@@ -1020,19 +1084,20 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
         for note in rejections:
             log.warning("  merge: %s", note)
 
-        for result in results:
-            log.info("  [%s] %s (%d round(s)%s) — %s",
-                     result.status, result.sub_question, result.iterations,
-                     ", escalated" if result.escalated else "",
-                     result.note or "no note")
+        for i, result in enumerate(results, start=1):
+            log.info("    w%d  %-13s %d round(s)%s, %d fact(s)%s",
+                     i, result.status, result.iterations,
+                     " escalated" if result.escalated else "",
+                     len(result.facts),
+                     f" - {_clip(result.note, 60)}" if result.note else "")
 
         verdict, gaps, suff_note = await _sufficient(ledger, results, cfg, budget)
-        log.info("wave %d: sufficient=%s (%s); calls %d/%d",
-                 wave, verdict, suff_note or "no note",
-                 budget.llm_calls, budget.max_llm_calls)
+        log.info("  sufficient=%s - %s  [%d/%d calls, %s tokens]",
+                 verdict, _clip(suff_note, 70) or "no note",
+                 budget.llm_calls, budget.max_llm_calls, _tokens(budget.tokens))
         for gap in gaps:
-            log.info("  gap: %s", gap)
-        _log_block(f"  ledger after wave {wave}:", ledger.render())
+            log.info("    gap: %s", _clip(gap, 90))
+        _log_block("  ledger:", ledger.summary())
 
         entry = {
             "wave": wave,
@@ -1066,9 +1131,10 @@ async def investigate(question: str, *, cfg: Optional[WaveConfig] = None) -> Wav
             verdict = "budget_exhausted"
 
     seconds = time.monotonic() - started
-    log.info("investigation finished: verdict=%s after %d wave(s), %d llm calls, "
-             "%d tokens, %.1fs", verdict, wave, budget.llm_calls, budget.tokens, seconds)
-    _log_block("final ledger:", ledger.render())
+    log.info("")
+    log.info("DONE  verdict=%s  %d wave(s), %d call(s), %s tokens, %.0fs",
+             verdict, wave, budget.llm_calls, _tokens(budget.tokens), seconds)
+    _log_block("  final ledger:", ledger.summary())
 
     return WaveRun(
         question=question,
@@ -1109,5 +1175,5 @@ async def answer(question: str, *, cfg: Optional[WaveConfig] = None) -> str:
     """Full pipeline: investigate -> synthesize. The bot.py seam."""
     run = await investigate(question, cfg=cfg)
     answer_text = await synthesize(run)
-    log.info("answer (%d chars): %s", len(answer_text), answer_text)
+    _log_block(f"answer ({len(answer_text)} chars):", answer_text)
     return answer_text
