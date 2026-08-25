@@ -419,8 +419,13 @@ re-run from that point with modified config.
   - Thread walker — follow `reply_to_message_id` *upward* to rebuild a
     reply chain (only the downward `replies_to` exists). Structural, immune
     to the interleaved-topic noise time windows pick up.
-  - Day-summary reader — `day_summaries` prose + facets as cheap
-    orientation before drilling. Never citable, like clusters.
+  - ~~Day-summary reader~~ — **built 2026-08-25** as `read_summaries` and
+    `summary_coverage`. The only instrument that answers a question about a
+    stretch of time rather than about particular messages, and the only one
+    that returns rows in chronological order. `detail='brief'` covers up to 60
+    days as facets alone; `detail='full'` adds prose for up to 10. Never
+    citable, like clusters — every row carries first/last message id so a day
+    that matters can be opened with `structured_search`.
   - Facet search — the GIN-indexed `facets` JSONB: "days whose facets
     mention X", no embeddings.
   - Real text search — tsvector full-text and/or pg_trgm fuzzy match,

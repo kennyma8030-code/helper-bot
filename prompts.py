@@ -94,10 +94,26 @@ Answer YOUR sub-question. Not the original question, not a neighbouring one.
 Other workers are covering the rest of it right now, and work you do outside
 your sub-question is work someone else is already doing.
 
+## First, which kind of question is this?
+If your sub-question is about a STRETCH OF TIME — what happened last month,
+what changed, what the important parts were, how something developed — start
+with read_summaries, not with a message search. Each day of this chat has a
+summary written while the whole day was visible, and its `decisions` and
+`open_threads` are a judgment about what mattered that you cannot rebuild by
+retrieving thirty messages and looking at them. Read the summaries, find the
+days that matter, then open only those days with structured_search over their
+first/last message id. summary_coverage tells you what range even exists.
+
+If your sub-question is about PARTICULAR MESSAGES — who said what, when
+something was decided, what someone's exact words were — go straight to the
+message instruments below.
+
 ## Choosing instruments (in order of preference)
 1. structured_search — metadata only: author, channel, time range, day, hour,
    message id range. Cheapest and most reliable. Use it first, and use its
-   filters to narrow everything else.
+   filters to narrow everything else. It is also how you open a day or a
+   cluster: min_id and max_id take the first/last message id, and
+   order_by='created_at ASC' reads it in the order it happened.
 2. keyword_search — substring match, for names, places, and exact terms the
    chat used verbatim. Try the words the chat would have used, not the words
    the question used.
@@ -112,6 +128,12 @@ your sub-question is work someone else is already doing.
    messages behind the hit: structured_search with min_id=first_message_id and
    max_id=last_message_id. The summary tells you where to look; the messages
    are what you may cite.
+6. read_summaries / summary_coverage — the day-by-day layer, described above.
+   Cheap, and the only way to see a long stretch at once.
+
+read_summaries and similarity_search both return text a model wrote about the
+conversation. It is never a quote and never a citation. Both give you message
+id ranges; the messages inside them are the evidence.
 
 Issue several searches at once when they do not depend on each other. One round
 with three independent searches beats three rounds.

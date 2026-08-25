@@ -118,6 +118,41 @@ TOOLS = types.Tool(function_declarations=[
         }),
     ),
     types.FunctionDeclaration(
+        name="read_summaries",
+        description=(
+            "Day-by-day summaries of the chat over a stretch of time, oldest "
+            "first. START HERE for any question about a period rather than a "
+            "particular message — what happened last month, what changed, what "
+            "the important parts were. Each day was summarized with the whole "
+            "day in view, so its decisions and open_threads are a judgment "
+            "about what mattered that you cannot rebuild from thirty retrieved "
+            "messages. detail='brief' gives topics, decisions and open threads "
+            "for many days at once; detail='full' adds the written summary for "
+            "a few days. Like similarity_search this is a signpost, never a "
+            "quote: cite nothing from here, and open a day with "
+            "structured_search over its first/last message id."
+        ),
+        parameters=_obj({
+            "after": _s("STRING", "Only days on or after this date, e.g. 2026-03-01"),
+            "before": _s("STRING", "Only days on or before this date"),
+            "channel_id": _s("INTEGER", "Optionally restrict to one channel"),
+            "detail": _s("STRING", "'brief' (default, many days) or 'full' (adds prose, few days)"),
+            "limit": _s("INTEGER", "Max days to return (brief up to 60, full up to 10)"),
+        }),
+    ),
+    types.FunctionDeclaration(
+        name="summary_coverage",
+        description=(
+            "How much summarized history exists: first day, last day, and how "
+            "many days are covered. Ask this before requesting a range you are "
+            "not sure exists — a short answer to 'summarize last month' is "
+            "otherwise indistinguishable from a quiet month."
+        ),
+        parameters=_obj({
+            "channel_id": _s("INTEGER", "Optionally restrict to one channel"),
+        }),
+    ),
+    types.FunctionDeclaration(
         name="similarity_search",
         description=(
             "Semantic search over conversation summaries — finds discussions by "
@@ -138,9 +173,21 @@ TOOLS = types.Tool(function_declarations=[
 ])
 
 # Which tools hand back message rows, as opposed to something else. A cluster
-# hit is a pointer and a count is a number; neither is evidence, and neither
-# belongs in front of the grader.
+# hit is a pointer, a summary is model-written prose, and a count is a number;
+# none of them is evidence, and none belongs in front of the grader as a thing
+# that could be cited.
 MESSAGE_TOOLS = {"structured_search", "keyword_search", "replies_to", "messages_near"}
+
+# How many summaries one call may return. Two ceilings because the two detail
+# levels are different sizes: a brief row is a handful of facets, a full row
+# carries 150-400 words of prose, so the same row count is an order of
+# magnitude apart in tokens.
+MAX_SUMMARIES_BRIEF = 60
+MAX_SUMMARIES_FULL = 10
+
+# Facet lists get long on a busy day — twenty entities, a dozen topics. The
+# head of each is where the anchors are.
+MAX_FACET_ITEMS = 12
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +235,40 @@ def compact_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _compact_summary(row: dict[str, Any], *, full: bool) -> dict[str, Any]:
+    """One summary row, trimmed to what a reader needs.
+
+    The facets are the reason this instrument exists — decisions and
+    open_threads are a judgment about what mattered, made when the whole day
+    was visible — so they survive even in brief mode. The prose does not: it is
+    the expensive half, and it is only worth paying for once a day has been
+    chosen.
+    """
+    facets = row.get("facets") or {}
+    trimmed: dict[str, Any] = {}
+    for key, value in facets.items():
+        if isinstance(value, list):
+            trimmed[key] = value[:MAX_FACET_ITEMS]
+            if len(value) > MAX_FACET_ITEMS:
+                trimmed[key].append(f"… +{len(value) - MAX_FACET_ITEMS} more")
+        else:
+            trimmed[key] = value
+
+    out: dict[str, Any] = {
+        "summary_date": str(row.get("summary_date")),
+        "channel_id": row.get("channel_id"),
+        "message_count": row.get("message_count"),
+        # The drill-down range, so a day that looks worth reading can be opened
+        # with structured_search(min_id=..., max_id=...) in the next round.
+        "first_message_id": row.get("first_message_id"),
+        "last_message_id": row.get("last_message_id"),
+        "facets": trimmed,
+    }
+    if full:
+        out["prose"] = row.get("prose")
+    return out
+
+
 async def execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
     """Run one instrument. Raises on an unknown tool or a bad argument."""
     filters, rest = _split_args(args)
@@ -216,6 +297,27 @@ async def execute_call(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
             filters=filters or None,
             limit=limit,
         )
+    elif name == "read_summaries":
+        full = str(rest.get("detail", "brief")).lower() == "full"
+        ceiling = MAX_SUMMARIES_FULL if full else MAX_SUMMARIES_BRIEF
+        # Default to the ceiling rather than to `limit`: this instrument is for
+        # covering a stretch, and quietly handing back 20 days of a 60-day
+        # question is worse than handing back all of it.
+        rows = await db.read_summaries(
+            channel_id=int(filters["channel_id"]) if "channel_id" in filters else None,
+            # _split_args parses these into datetimes; the column is a date.
+            after=filters["after"].date() if "after" in filters else None,
+            before=filters["before"].date() if "before" in filters else None,
+            limit=max(1, min(int(rest.get("limit", ceiling)), ceiling)),
+        )
+        return [_compact_summary(r, full=full) for r in rows]
+    elif name == "summary_coverage":
+        row = await db.summary_date_range(
+            int(filters["channel_id"]) if "channel_id" in filters else None
+        )
+        return [{"first_day": str(row["first_day"]) if row["first_day"] else None,
+                 "last_day": str(row["last_day"]) if row["last_day"] else None,
+                 "days_summarized": row["days"]}]
     elif name == "similarity_search":
         # is_query: the stored side embedded summaries as documents, and the two
         # sides are not interchangeable for this model.

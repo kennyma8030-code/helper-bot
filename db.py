@@ -948,6 +948,92 @@ async def recent_day_summaries(
         return await cur.fetchall()
 
 
+# ---------------------------------------------------------------------------
+# Retrieval instrument 7: the summary layer (orientation, never evidence)
+# ---------------------------------------------------------------------------
+# The one instrument that answers a question about a stretch of time rather
+# than about particular messages. A day summary was written with the whole day
+# in view, so its facets — decisions, open_threads — carry a judgment about
+# what mattered that no reader of thirty retrieved rows can reconstruct.
+#
+# Same rule as clusters: this text is model-written and is never citable. A
+# summary tells you which span is worth opening; first_message_id and
+# last_message_id are how you open it.
+
+async def read_summaries(
+    *,
+    channel_id: Optional[int] = None,
+    after: Optional[date] = None,
+    before: Optional[date] = None,
+    granularity: str = "day",
+    limit: int = 14,
+) -> list[dict[str, Any]]:
+    """Day summaries across a date range, **oldest first**.
+
+    Chronological on purpose, and it is the only instrument that is. Every
+    other read here sorts by recency or by count, because they answer "find
+    me the messages that..."; this one answers "what happened over this
+    stretch", and a stretch read out of order is not a story.
+
+    `limit` truncates from the OLD end — an unbounded call returns the most
+    recent summaries rather than the first ones ever written, which is the
+    useful default for "what has been going on". Index: the range scan rides
+    day_summaries_date_idx (channel_id, summary_date).
+    """
+    if granularity not in ("day", "session"):
+        raise ValueError("granularity must be 'day' or 'session'")
+
+    clauses = ["granularity = %s"]
+    params: list[Any] = [granularity]
+    if channel_id is not None:
+        clauses.append("channel_id = %s")
+        params.append(channel_id)
+    if after is not None:
+        clauses.append("summary_date >= %s")
+        params.append(after)
+    if before is not None:
+        clauses.append("summary_date <= %s")
+        params.append(before)
+
+    # Newest `limit` rows in the range, then flipped back into reading order.
+    sql = f"""
+        SELECT * FROM (
+            SELECT id, summary_date, channel_id, granularity, started_at, ended_at,
+                   prose, facets, first_message_id, last_message_id, message_count
+              FROM day_summaries
+             WHERE {" AND ".join(clauses)}
+          ORDER BY summary_date DESC, started_at DESC
+             LIMIT %s
+        ) recent
+      ORDER BY summary_date ASC, started_at ASC
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(sql, [*params, limit])
+        return await cur.fetchall()
+
+
+async def summary_date_range(channel_id: Optional[int] = None) -> dict[str, Any]:
+    """How much summarized history exists: first date, last date, and how many.
+
+    What a reader needs before asking for a range — "summarize last month" is
+    unanswerable if the summariser has only ever covered a week, and finding
+    that out by getting a short result back is guesswork.
+    """
+    where, params = ("WHERE channel_id = %s", [channel_id]) if channel_id else ("", [])
+    sql = f"""
+        SELECT MIN(summary_date) AS first_day,
+               MAX(summary_date) AS last_day,
+               COUNT(*)          AS days
+          FROM day_summaries {where} {"AND" if where else "WHERE"} granularity = 'day'
+    """
+    pool = _get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(sql, params)
+        row = await cur.fetchone()
+    return row or {"first_day": None, "last_day": None, "days": 0}
+
+
 async def summary_watermark(channel_id: int) -> Optional[date]:
     """Last date this channel is summarized through, or None if never run."""
     pool = _get_pool()
